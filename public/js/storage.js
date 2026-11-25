@@ -4,11 +4,13 @@
  * - Falls back seamlessly to localStorage + URL-encoded course config on static hosts (GitHub Pages)
  */
 
-import { cloneDefaultFields, createCourseObject } from './defaults.js';
+import { cloneDefaultFields, createCourseObject, DEFAULT_FIELDS } from './defaults.js';
 import { generateSeteuk } from './generator.js';
 
 const LS_COURSES_KEY = 'speciality_v1_courses';
 const LS_SUBS_KEY = 'speciality_v1_submissions';
+const DEFAULT_DESC =
+  '한 학기 동안의 수업과 탐구 활동을 돌아보며 아래 항목을 성실하게 작성해 주세요.';
 
 let backendAvailable = null;
 
@@ -61,8 +63,7 @@ function readLocalCourses() {
     createCourseObject({
       id: 'sci_lab_01',
       title: '과학탐구실험',
-      description:
-        '한 학기 동안의 수업과 탐구 활동을 돌아보며 아래 항목을 성실하게 작성해 주세요. 제출 내용은 수업 기록 참고 자료로 활용됩니다.',
+      description: DEFAULT_DESC,
       isJointCurriculum: false,
       isOpen: true,
       fields: cloneDefaultFields(),
@@ -93,24 +94,44 @@ function writeLocalSubs(subs) {
   localStorage.setItem(LS_SUBS_KEY, JSON.stringify(subs));
 }
 
-// UTF-8 safe base64url encode/decode for QR course config sharing in static mode
+function isSameAsDefaultFields(fields) {
+  if (!Array.isArray(fields) || fields.length !== DEFAULT_FIELDS.length) return false;
+  return fields.every((f, idx) => {
+    const d = DEFAULT_FIELDS[idx];
+    return (
+      f.id === d.id &&
+      f.label === d.label &&
+      f.type === d.type &&
+      f.role === d.role &&
+      Boolean(f.required) === Boolean(d.required) &&
+      (f.placeholder || '') === (d.placeholder || '')
+    );
+  });
+}
+
+// UTF-8 safe compact base64url encode/decode for QR course config sharing in static mode
 export function encodeCourseConfig(course) {
   const minimal = {
-    id: course.id,
     t: course.title,
-    d: course.description || '',
     j: course.isJointCurriculum ? 1 : 0,
-    o: course.isOpen ? 1 : 0,
-    f: (course.fields || []).map((f) => ({
-      i: f.id,
-      l: f.label,
-      p: f.placeholder || '',
-      y: f.type || 'textarea',
-      r: f.role || 'custom',
-      q: f.required ? 1 : 0,
-      o: f.options || [],
-    })),
   };
+  if (course.description && course.description.trim() !== DEFAULT_DESC) {
+    minimal.d = course.description.trim();
+  }
+  if (course.isOpen === false) {
+    minimal.o = 0;
+  }
+  if (!isSameAsDefaultFields(course.fields)) {
+    minimal.f = (course.fields || []).map((f) => {
+      const item = { i: f.id, l: f.label };
+      if (f.type && f.type !== 'textarea') item.y = f.type;
+      if (f.role && f.role !== 'custom') item.r = f.role;
+      if (f.required) item.q = 1;
+      if (f.placeholder) item.p = f.placeholder;
+      if (Array.isArray(f.options) && f.options.length > 0) item.o = f.options;
+      return item;
+    });
+  }
   const json = JSON.stringify(minimal);
   const bytes = new TextEncoder().encode(json);
   let bin = '';
@@ -120,7 +141,7 @@ export function encodeCourseConfig(course) {
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-export function decodeCourseConfig(encoded) {
+export function decodeCourseConfig(encoded, fallbackId = '') {
   try {
     const pad = encoded.length % 4 === 0 ? '' : '='.repeat(4 - (encoded.length % 4));
     const b64 = encoded.replace(/-/g, '+').replace(/_/g, '/') + pad;
@@ -129,9 +150,9 @@ export function decodeCourseConfig(encoded) {
     const json = new TextDecoder().decode(bytes);
     const m = JSON.parse(json);
     return {
-      id: m.id,
+      id: m.id || fallbackId,
       title: m.t || '수집 과목',
-      description: m.d || '',
+      description: m.d !== undefined ? m.d : DEFAULT_DESC,
       isJointCurriculum: Boolean(m.j),
       isOpen: m.o !== 0,
       fields: Array.isArray(m.f)
@@ -178,7 +199,7 @@ export const api = {
     const local = readLocalCourses().find((c) => c.id === courseId);
     if (local) return local;
     if (cfgParam) {
-      const decoded = decodeCourseConfig(cfgParam);
+      const decoded = decodeCourseConfig(cfgParam, courseId);
       if (decoded) return decoded;
     }
     throw new Error('존재하지 않는 과목입니다. 선생님께 새 QR코드를 요청해 주세요.');
@@ -313,12 +334,34 @@ export const api = {
     if (await checkBackend()) {
       return `/api/qr?format=png&text=${encodeURIComponent(targetUrl)}`;
     }
-    if (typeof window !== 'undefined' && window.QRCode?.toDataURL) {
-      return window.QRCode.toDataURL(targetUrl, {
-        width: 512,
-        margin: 2,
-        color: { dark: '#142927', light: '#FFFFFF' },
-      });
+    if (typeof window !== 'undefined' && typeof window.qrcode === 'function') {
+      const ecLevel = targetUrl.length > 500 ? 'L' : 'M';
+      const qr = window.qrcode(0, ecLevel);
+      qr.addData(targetUrl, 'Byte');
+      qr.make();
+
+      const count = qr.getModuleCount();
+      const margin = 4;
+      const targetSize = 512;
+      const cell = Math.max(2, Math.floor(targetSize / (count + margin * 2)));
+      const size = cell * (count + margin * 2);
+
+      const canvas = document.createElement('canvas');
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, size, size);
+      ctx.fillStyle = '#142927';
+
+      for (let r = 0; r < count; r += 1) {
+        for (let c = 0; c < count; c += 1) {
+          if (qr.isDark(r, c)) {
+            ctx.fillRect((c + margin) * cell, (r + margin) * cell, cell, cell);
+          }
+        }
+      }
+      return canvas.toDataURL('image/png');
     }
     return '';
   },
