@@ -2,16 +2,24 @@ import {
   AI_CLOSING_TEMPLATES,
   AI_DETAIL_LEVELS,
   AI_ENDING_TONES,
+  CLAUDE_MODELS,
   cloneDefaultFields,
   DEFAULT_AI_SETTINGS,
   FIELD_ROLES,
+  GEMINI_MODELS,
   GENERATION_STYLES,
+  WEBLLM_MODELS,
 } from './defaults.js';
 import {
   calcNeisBytes,
   generateSeteuk,
+  getWebLlmState,
+  loadWebLlmModel,
   NEIS_BYTE_LIMIT,
+  refineWithClaude,
   refineWithGemini,
+  refineWithWebLlm,
+  unloadWebLlm,
 } from './generator.js';
 import { api, encodeCourseConfig, getAiSettings, saveAiSettings } from './storage.js';
 
@@ -70,6 +78,19 @@ function setGeminiKey(key) {
     localStorage.setItem('speciality_gemini_api_key', trimmed);
   } else {
     localStorage.removeItem('speciality_gemini_api_key');
+  }
+}
+
+function getClaudeKey() {
+  return localStorage.getItem('speciality_claude_api_key') || '';
+}
+
+function setClaudeKey(key) {
+  const trimmed = key.trim();
+  if (trimmed) {
+    localStorage.setItem('speciality_claude_api_key', trimmed);
+  } else {
+    localStorage.removeItem('speciality_claude_api_key');
   }
 }
 
@@ -644,7 +665,18 @@ function renderSubmissionDetailHtml(course, sub) {
     })
     .join('');
 
-  const hasGemini = Boolean(getGeminiKey());
+  const aiSettings = getAiSettings();
+  const provider = aiSettings.activeAiProvider || 'gemini';
+  const webllmStatus = getWebLlmState();
+  const aiBtnLabel = state.isGeneratingAi
+    ? state.aiProgressLabel || 'AI 다듬는 중...'
+    : provider === 'webllm'
+    ? webllmStatus.loadedModel
+      ? 'WebLLM 다듬기'
+      : 'WebLLM 다듬기'
+    : provider === 'claude'
+    ? 'Claude 다듬기'
+    : 'Gemini 다듬기';
 
   return `
     <article class="panel seteuk-card">
@@ -683,17 +715,18 @@ function renderSubmissionDetailHtml(course, sub) {
       <div class="seteuk-actions">
         <div class="seteuk-actions-left">
           <button id="regen-one-btn" type="button" class="btn btn-soft btn-sm">
-            자동 다시 생성
+            내장 엔진 재작성
           </button>
-          ${
-            hasGemini
-              ? `<button id="ai-refine-btn" type="button" class="btn btn-secondary btn-sm" ${
-                  state.isGeneratingAi ? 'disabled' : ''
-                }>
-                  ${state.isGeneratingAi ? 'AI 다듬는 중...' : 'AI로 다듬기'}
-                </button>`
-              : ''
-          }
+          <select id="ai-provider-select" class="select" style="width:auto;padding:5px 10px;font-size:13px;" aria-label="생성형 AI 선택">
+            <option value="webllm"${provider === 'webllm' ? ' selected' : ''}>WebLLM (로컬)</option>
+            <option value="gemini"${provider === 'gemini' ? ' selected' : ''}>Gemini API</option>
+            <option value="claude"${provider === 'claude' ? ' selected' : ''}>Claude API</option>
+          </select>
+          <button id="ai-refine-btn" type="button" class="btn btn-secondary btn-sm" ${
+            state.isGeneratingAi ? 'disabled' : ''
+          }>
+            ${escapeHtml(aiBtnLabel)}
+          </button>
           <button id="delete-sub-btn" type="button" class="btn btn-danger-soft btn-sm">
             삭제
           </button>
@@ -1067,35 +1100,87 @@ function bindSubmissionsEvents() {
     }
   });
 
-  // Optional Gemini AI refine
+  // AI Provider quick switcher
+  document.getElementById('ai-provider-select')?.addEventListener('change', (e) => {
+    const nextProvider = e.target.value;
+    const cur = getAiSettings();
+    saveAiSettings({ ...cur, activeAiProvider: nextProvider });
+    renderTeacherApp();
+  });
+
+  // Generative AI refine (WebLLM / Gemini / Claude)
   document.getElementById('ai-refine-btn')?.addEventListener('click', async () => {
-    const apiKey = getGeminiKey();
-    if (!apiKey) {
-      openAiSettingsModal('gemini');
+    const aiSettings = getAiSettings();
+    const provider = aiSettings.activeAiProvider || 'gemini';
+    const style = sub.style || aiSettings.defaultStyle || 'inquiry';
+
+    if (provider === 'gemini' && !getGeminiKey()) {
+      showToast('Gemini API 키를 먼저 입력해 주세요.', 'error');
+      openAiSettingsModal('api');
       return;
     }
+    if (provider === 'claude' && !getClaudeKey()) {
+      showToast('Claude API 키를 먼저 입력해 주세요.', 'error');
+      openAiSettingsModal('api');
+      return;
+    }
+
     state.isGeneratingAi = true;
+    state.aiProgressLabel =
+      provider === 'webllm'
+        ? 'WebLLM 준비 중...'
+        : provider === 'claude'
+        ? 'Claude 생성 중...'
+        : 'Gemini 생성 중...';
     renderTeacherApp();
+
     try {
-      const aiSettings = getAiSettings();
-      const refined = await refineWithGemini({
-        apiKey,
-        course,
-        answers: sub.answers,
-        fields: course.fields,
-        style: sub.style || aiSettings.defaultStyle || 'inquiry',
-        aiSettings,
-      });
+      let refined = '';
+      if (provider === 'webllm') {
+        refined = await refineWithWebLlm({
+          course,
+          answers: sub.answers,
+          fields: course.fields,
+          style,
+          aiSettings,
+          onProgress: ({ progress }) => {
+            state.aiProgressLabel = progress < 100 ? `WebLLM 로딩 ${progress}%` : 'WebLLM 작성 중...';
+            const btn = document.getElementById('ai-refine-btn');
+            if (btn) btn.textContent = state.aiProgressLabel;
+          },
+        });
+      } else if (provider === 'claude') {
+        refined = await refineWithClaude({
+          apiKey: getClaudeKey(),
+          course,
+          answers: sub.answers,
+          fields: course.fields,
+          style,
+          aiSettings,
+        });
+      } else {
+        refined = await refineWithGemini({
+          apiKey: getGeminiKey(),
+          course,
+          answers: sub.answers,
+          fields: course.fields,
+          style,
+          aiSettings,
+        });
+      }
+
       const updated = await api.updateSubmission(sub.id, {
         generatedText: refined,
         status: 'auto',
       });
       replaceLocalSubmission(updated);
-      showToast('AI로 세특 문장을 자연스럽게 다듬었습니다.');
+      const label = provider === 'webllm' ? 'WebLLM' : provider === 'claude' ? 'Claude' : 'Gemini';
+      showToast(`${label}로 세특 문장을 자연스럽게 다듬었습니다.`);
     } catch (err) {
       showToast(err.message || 'AI 다듬기에 실패했습니다.', 'error');
     } finally {
       state.isGeneratingAi = false;
+      state.aiProgressLabel = '';
       renderTeacherApp();
     }
   });
@@ -1559,9 +1644,10 @@ async function openQrModal(course, fullscreen = false) {
 }
 
 function openAiSettingsModal(initialTab = 'builtin') {
-  let activeTab = initialTab;
+  let activeTab = initialTab === 'gemini' ? 'api' : initialTab;
   let draft = getAiSettings();
   let geminiKey = getGeminiKey();
+  let claudeKey = getClaudeKey();
   let applyToAll = false;
 
   const activeCourse = getActiveCourse();
@@ -1588,6 +1674,7 @@ function openAiSettingsModal(initialTab = 'builtin') {
   const renderModal = () => {
     const preview = renderPreviewText();
     const previewBytes = calcNeisBytes(preview);
+    const webllm = getWebLlmState();
 
     const styleOptions = GENERATION_STYLES.map(
       (s) =>
@@ -1617,20 +1704,47 @@ function openAiSettingsModal(initialTab = 'builtin') {
         )}</option>`
     ).join('');
 
+    const webllmModelOptions = WEBLLM_MODELS.map(
+      (m) =>
+        `<option value="${m.id}"${draft.webllmModel === m.id ? ' selected' : ''}>${escapeHtml(
+          m.label
+        )}</option>`
+    ).join('');
+
+    const geminiModelOptions = GEMINI_MODELS.map(
+      (m) =>
+        `<option value="${m.id}"${draft.geminiModel === m.id ? ' selected' : ''}>${escapeHtml(
+          m.label
+        )}</option>`
+    ).join('');
+
+    const claudeModelOptions = CLAUDE_MODELS.map(
+      (m) =>
+        `<option value="${m.id}"${draft.claudeModel === m.id ? ' selected' : ''}>${escapeHtml(
+          m.label
+        )}</option>`
+    ).join('');
+
+    const apiDot = geminiKey.trim() || claudeKey.trim() ? ' ●' : '';
+    const webllmDot = webllm.loadedModel ? ' ●' : '';
+
     modalRoot.innerHTML = `
       <div class="modal-backdrop" id="modal-backdrop">
         <div class="modal-dialog ai-modal" role="dialog" aria-modal="true" aria-labelledby="ai-modal-title">
           <div class="modal-head">
-            <h3 id="ai-modal-title">내장 AI 및 세특 자동 작성 설정</h3>
+            <h3 id="ai-modal-title">AI 및 세특 자동 작성 설정</h3>
             <button type="button" class="btn btn-ghost btn-icon" id="modal-close-btn">✕</button>
           </div>
 
           <div class="modal-tabs" role="tablist">
             <button type="button" class="modal-tab-btn${activeTab === 'builtin' ? ' active' : ''}" data-ai-tab="builtin">
-              내장 AI 엔진 조절 (기본)
+              내장 규칙 엔진
             </button>
-            <button type="button" class="modal-tab-btn${activeTab === 'gemini' ? ' active' : ''}" data-ai-tab="gemini">
-              외부 Gemini AI 연동 (선택)${geminiKey.trim() ? ' ●' : ''}
+            <button type="button" class="modal-tab-btn${activeTab === 'webllm' ? ' active' : ''}" data-ai-tab="webllm">
+              WebLLM (로컬 AI)${webllmDot}
+            </button>
+            <button type="button" class="modal-tab-btn${activeTab === 'api' ? ' active' : ''}" data-ai-tab="api">
+              Claude · Gemini API${apiDot}
             </button>
           </div>
 
@@ -1705,7 +1819,7 @@ function openAiSettingsModal(initialTab = 'builtin') {
 
                 <div class="ai-preview-box">
                   <div class="ai-preview-head">
-                    <span>실시간 내장 AI 생성 미리보기</span>
+                    <span>실시간 내장 엔진 생성 미리보기</span>
                     <span id="ai-preview-bytes" class="byte-count-mono${
                       previewBytes > NEIS_BYTE_LIMIT ? ' over' : ''
                     }">${previewBytes.toLocaleString()} / ${NEIS_BYTE_LIMIT.toLocaleString()} Bytes · ${
@@ -1726,50 +1840,149 @@ function openAiSettingsModal(initialTab = 'builtin') {
                     : ''
                 }
               `
-                  : `
-                <p style="font-size:13.5px;color:var(--text-secondary);">
-                  내장 AI만으로도 즉시 자동 작성되지만, <strong>Gemini API 키</strong>를 등록하면 학생별 상세 화면에서 <em>AI로 다듬기</em> 버튼을 추가로 사용할 수 있습니다.
-                </p>
-                <div class="field-group">
-                  <label for="gemini-key-input">Gemini API Key (이 브라우저에만 저장됨)</label>
-                  <input id="gemini-key-input" type="password" class="input" value="${escapeHtml(
-                    geminiKey
-                  )}" placeholder="AIza..." autocomplete="off" />
+                  : activeTab === 'webllm'
+                  ? `
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+                  <p style="font-size:13.5px;color:var(--text-secondary);flex:1;">
+                    외부 API 키 없이 내 브라우저의 GPU(WebGPU)로 오픈소스 LLM을 직접 실행합니다. 학생 응답이 외부로 전송되지 않습니다.
+                  </p>
+                  <span class="badge ${webllm.supported ? 'badge-success' : 'badge-danger'}">
+                    ${webllm.supported ? 'WebGPU 지원됨' : 'WebGPU 미지원'}
+                  </span>
                 </div>
-                <div class="form-grid-2">
-                  <div class="field-group">
-                    <label for="gemini-model-select">모델 선택</label>
-                    <select id="gemini-model-select" class="select">
-                      <option value="gemini-2.0-flash"${
-                        draft.geminiModel === 'gemini-2.0-flash' ? ' selected' : ''
-                      }>gemini-2.0-flash (빠름 · 권장)</option>
-                      <option value="gemini-2.5-flash"${
-                        draft.geminiModel === 'gemini-2.5-flash' ? ' selected' : ''
-                      }>gemini-2.5-flash (최신 균형)</option>
-                      <option value="gemini-2.5-pro"${
-                        draft.geminiModel === 'gemini-2.5-pro' ? ' selected' : ''
-                      }>gemini-2.5-pro (정교함)</option>
-                    </select>
+
+                <div class="field-group">
+                  <label for="webllm-model-select">WebLLM 모델 선택 (목록)</label>
+                  <select id="webllm-model-select" class="select">${webllmModelOptions}</select>
+                </div>
+
+                <div class="ai-preview-box">
+                  <div class="ai-preview-head">
+                    <span>모델 상태</span>
+                    <span id="webllm-status-badge" class="badge ${
+                      webllm.loadedModel ? 'badge-success' : 'badge-muted'
+                    }">
+                      ${webllm.loadedModel ? `준비됨 (${webllm.loadedModel})` : '미로드'}
+                    </span>
                   </div>
-                  <div class="field-group">
-                    <label for="gemini-temp-range">문장 다양성 (Temperature: <span id="gemini-temp-val">${Number(
+                  <div id="webllm-progress-text" style="font-size:12.5px;color:var(--text-secondary);">
+                    ${escapeHtml(
+                      webllm.progressText ||
+                        '처음 1회 모델 다운로드(1~4.5GB) 후 브라우저에 캐시되어 빠르게 실행됩니다.'
+                    )}
+                  </div>
+                  <div class="byte-bar-track">
+                    <div id="webllm-progress-bar" class="byte-bar-fill" style="width:${webllm.progressPct || 0}%"></div>
+                  </div>
+                  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;">
+                    <button type="button" id="webllm-load-btn" class="btn btn-soft btn-sm" ${
+                      !webllm.supported || webllm.loading ? 'disabled' : ''
+                    }>
+                      ${webllm.loading ? '불러오는 중...' : '선택 모델 미리 불러오기'}
+                    </button>
+                    ${
+                      webllm.loadedModel
+                        ? '<button type="button" id="webllm-unload-btn" class="btn btn-ghost btn-sm">메모리 해제</button>'
+                        : ''
+                    }
+                  </div>
+                </div>
+
+                <div class="field-group">
+                  <label for="ai-temp-range">문장 다양성 (Temperature: <span id="ai-temp-val">${Number(
+                    draft.geminiTemperature ?? 0.5
+                  ).toFixed(1)}</span>)</label>
+                  <div class="range-row">
+                    <span style="font-size:12px;color:var(--text-muted);">차분</span>
+                    <input id="ai-temp-range" type="range" min="0.1" max="1.0" step="0.1" value="${Number(
                       draft.geminiTemperature ?? 0.5
-                    ).toFixed(1)}</span>)</label>
-                    <div class="range-row">
-                      <span style="font-size:12px;color:var(--text-muted);">차분</span>
-                      <input id="gemini-temp-range" type="range" min="0.1" max="1.0" step="0.1" value="${Number(
-                        draft.geminiTemperature ?? 0.5
-                      )}" />
-                      <span style="font-size:12px;color:var(--text-muted);">풍부</span>
-                    </div>
+                    )}" />
+                    <span style="font-size:12px;color:var(--text-muted);">풍부</span>
                   </div>
                 </div>
+
                 <div class="field-group">
-                  <label for="gemini-instruction">추가 작성 지침 (선택)</label>
-                  <textarea id="gemini-instruction" class="textarea" rows="3" placeholder="예: 실험 과정에서의 오차 분석과 협력적 태도를 자연스럽게 강조해 주세요.">${escapeHtml(
+                  <label for="ai-instruction">추가 작성 지침 (WebLLM · API 공통)</label>
+                  <textarea id="ai-instruction" class="textarea" rows="2" placeholder="예: 실험 과정의 오차 분석과 과학적 탐구 태도를 자연스럽게 강조해 주세요.">${escapeHtml(
                     draft.geminiInstruction || ''
                   )}</textarea>
                 </div>
+              `
+                  : `
+                <div class="field-group">
+                  <label for="ai-active-provider">기본 생성형 AI 공급자 (상세 화면 기본 선택)</label>
+                  <select id="ai-active-provider" class="select">
+                    <option value="webllm"${draft.activeAiProvider === 'webllm' ? ' selected' : ''}>WebLLM (브라우저 로컬 AI · 무료)</option>
+                    <option value="gemini"${draft.activeAiProvider === 'gemini' ? ' selected' : ''}>Google Gemini API</option>
+                    <option value="claude"${draft.activeAiProvider === 'claude' ? ' selected' : ''}>Anthropic Claude API</option>
+                  </select>
+                </div>
+
+                <div class="ai-preview-box">
+                  <div class="ai-preview-head">
+                    <span>Google Gemini API</span>
+                    <span class="badge ${geminiKey.trim() ? 'badge-success' : 'badge-muted'}">
+                      ${geminiKey.trim() ? '키 등록됨' : '미등록'}
+                    </span>
+                  </div>
+                  <div class="form-grid-2">
+                    <div class="field-group">
+                      <label for="gemini-key-input">Gemini API Key</label>
+                      <input id="gemini-key-input" type="password" class="input" value="${escapeHtml(
+                        geminiKey
+                      )}" placeholder="AIza..." autocomplete="off" />
+                    </div>
+                    <div class="field-group">
+                      <label for="gemini-model-select">Gemini 모델 선택</label>
+                      <select id="gemini-model-select" class="select">${geminiModelOptions}</select>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="ai-preview-box">
+                  <div class="ai-preview-head">
+                    <span>Anthropic Claude API</span>
+                    <span class="badge ${claudeKey.trim() ? 'badge-success' : 'badge-muted'}">
+                      ${claudeKey.trim() ? '키 등록됨' : '미등록'}
+                    </span>
+                  </div>
+                  <div class="form-grid-2">
+                    <div class="field-group">
+                      <label for="claude-key-input">Claude API Key</label>
+                      <input id="claude-key-input" type="password" class="input" value="${escapeHtml(
+                        claudeKey
+                      )}" placeholder="sk-ant-..." autocomplete="off" />
+                    </div>
+                    <div class="field-group">
+                      <label for="claude-model-select">Claude 모델 선택</label>
+                      <select id="claude-model-select" class="select">${claudeModelOptions}</select>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="field-group">
+                  <label for="ai-temp-range">문장 다양성 (Temperature: <span id="ai-temp-val">${Number(
+                    draft.geminiTemperature ?? 0.5
+                  ).toFixed(1)}</span>)</label>
+                  <div class="range-row">
+                    <span style="font-size:12px;color:var(--text-muted);">차분</span>
+                    <input id="ai-temp-range" type="range" min="0.1" max="1.0" step="0.1" value="${Number(
+                      draft.geminiTemperature ?? 0.5
+                    )}" />
+                    <span style="font-size:12px;color:var(--text-muted);">풍부</span>
+                  </div>
+                </div>
+
+                <div class="field-group">
+                  <label for="ai-instruction">추가 작성 지침 (WebLLM · API 공통)</label>
+                  <textarea id="ai-instruction" class="textarea" rows="2" placeholder="예: 실험 과정의 오차 분석과 협력적 태도를 자연스럽게 강조해 주세요.">${escapeHtml(
+                    draft.geminiInstruction || ''
+                  )}</textarea>
+                </div>
+
+                <p style="font-size:12px;color:var(--text-muted);">
+                  * 모든 API 키는 서버로 전송되지 않고 현재 사용 중인 교사 브라우저(localStorage)에만 안전하게 보관됩니다.
+                </p>
               `
               }
             </div>
@@ -1814,7 +2027,7 @@ function openAiSettingsModal(initialTab = 'builtin') {
     document.getElementById('ai-reset-btn')?.addEventListener('click', () => {
       draft = { ...DEFAULT_AI_SETTINGS };
       renderModal();
-      showToast('내장 AI 설정을 기본값으로 되돌렸습니다.');
+      showToast('AI 설정을 기본값으로 되돌렸습니다.');
     });
 
     // Built-in tab bindings
@@ -1854,19 +2067,62 @@ function openAiSettingsModal(initialTab = 'builtin') {
       applyToAll = e.target.checked;
     });
 
-    // Gemini tab bindings
+    // WebLLM tab bindings
+    document.getElementById('webllm-model-select')?.addEventListener('change', (e) => {
+      draft.webllmModel = e.target.value;
+    });
+    document.getElementById('webllm-load-btn')?.addEventListener('click', async () => {
+      const btn = document.getElementById('webllm-load-btn');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = '불러오는 중...';
+      }
+      try {
+        await loadWebLlmModel(draft.webllmModel, ({ progress, text }) => {
+          const textEl = document.getElementById('webllm-progress-text');
+          const barEl = document.getElementById('webllm-progress-bar');
+          if (textEl) textEl.textContent = text;
+          if (barEl) barEl.style.width = `${progress}%`;
+        });
+        draft.activeAiProvider = 'webllm';
+        saveAiSettings(draft);
+        showToast('WebLLM 모델 준비가 완료되었습니다!');
+        renderModal();
+      } catch (err) {
+        showToast(err.message || 'WebLLM 모델 로드에 실패했습니다.', 'error');
+        renderModal();
+      }
+    });
+    document.getElementById('webllm-unload-btn')?.addEventListener('click', async () => {
+      await unloadWebLlm();
+      showToast('WebLLM 모델 메모리를 해제했습니다.');
+      renderModal();
+    });
+
+    // API tab bindings
+    document.getElementById('ai-active-provider')?.addEventListener('change', (e) => {
+      draft.activeAiProvider = e.target.value;
+    });
     document.getElementById('gemini-key-input')?.addEventListener('input', (e) => {
       geminiKey = e.target.value;
     });
     document.getElementById('gemini-model-select')?.addEventListener('change', (e) => {
       draft.geminiModel = e.target.value;
     });
-    document.getElementById('gemini-temp-range')?.addEventListener('input', (e) => {
+    document.getElementById('claude-key-input')?.addEventListener('input', (e) => {
+      claudeKey = e.target.value;
+    });
+    document.getElementById('claude-model-select')?.addEventListener('change', (e) => {
+      draft.claudeModel = e.target.value;
+    });
+
+    // Shared Temperature & Instruction bindings
+    document.getElementById('ai-temp-range')?.addEventListener('input', (e) => {
       draft.geminiTemperature = Number(e.target.value);
-      const valEl = document.getElementById('gemini-temp-val');
+      const valEl = document.getElementById('ai-temp-val');
       if (valEl) valEl.textContent = draft.geminiTemperature.toFixed(1);
     });
-    document.getElementById('gemini-instruction')?.addEventListener('input', (e) => {
+    document.getElementById('ai-instruction')?.addEventListener('input', (e) => {
       draft.geminiInstruction = e.target.value;
     });
 
@@ -1874,6 +2130,7 @@ function openAiSettingsModal(initialTab = 'builtin') {
       e.preventDefault();
       saveAiSettings(draft);
       setGeminiKey(geminiKey);
+      setClaudeKey(claudeKey);
       closeModal();
 
       if (applyToAll && activeCourse && state.submissions.length > 0) {
@@ -1890,7 +2147,7 @@ function openAiSettingsModal(initialTab = 'builtin') {
           });
           await api.bulkUpdateSubmissions(updates);
           await selectCourse(activeCourse.id, true);
-          showToast(`내장 AI 설정을 저장하고 ${updates.length}명의 세특에 즉시 적용했습니다.`);
+          showToast(`AI 설정을 저장하고 ${updates.length}명의 세특에 즉시 적용했습니다.`);
           return;
         } catch (err) {
           showToast(err.message, 'error');
@@ -1898,7 +2155,7 @@ function openAiSettingsModal(initialTab = 'builtin') {
       }
 
       renderTeacherApp();
-      showToast('내장 AI 설정을 저장했습니다.');
+      showToast('AI 설정을 저장했습니다.');
     });
   };
 

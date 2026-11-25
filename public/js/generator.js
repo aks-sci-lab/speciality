@@ -388,17 +388,11 @@ export function generateSeteuk({
   return result;
 }
 
-/**
- * Optional Gemini API refinement (only called if teacher enters their own API key in settings)
- */
-export async function refineWithGemini({
-  apiKey,
-  course,
-  answers,
-  fields,
-  style,
-  aiSettings = {},
-}) {
+// ============================================================================
+// Shared Prompt Builder for Generative AI (WebLLM / Gemini / Claude)
+// ============================================================================
+
+export function buildAiPrompt({ course, answers, fields, style, aiSettings = {} }) {
   const settings = { ...DEFAULT_AI_SETTINGS, ...(aiSettings || {}) };
   const effectiveStyle = style || settings.defaultStyle || 'inquiry';
   const styleLabel =
@@ -415,11 +409,24 @@ export async function refineWithGemini({
       ? '약 400~480자(1,200~1,450 Bytes)'
       : '약 300~380자(900~1,150 Bytes)';
 
+  const toneGuide =
+    settings.endingTone === 'competency'
+      ? '~드러냄., ~발휘함., ~신장함. 등 역량 강조형 종결어미'
+      : settings.endingTone === 'growth'
+      ? '~성장함., ~확장함., ~기대됨. 등 성장 관찰형 종결어미'
+      : '~함., ~보임., ~이룸. 등 표준 NEIS 개조식 종결어미';
+
   const qaLines = fields
     .map((f, idx) => `${idx + 1}. ${f.label}: ${answers[f.id] || '(미작성)'}`)
     .join('\n');
 
   const extraRules = [];
+  if (settings.includeCourseTitle && course?.title) {
+    extraRules.push(`- 문장 서두에 '${course.title} 수업에서' 형태로 과목명을 자연스럽게 포함할 것.`);
+  }
+  if (settings.emphasizeMisconception) {
+    extraRules.push('- 기존 이해에서 과학적 근거로 개념을 정확히 재정립한 과정을 잘 드러낼 것.');
+  }
   if (settings.focusKeywords?.trim()) {
     extraRules.push(`- 교사 강조 키워드 반영: ${settings.focusKeywords.trim()}`);
   }
@@ -427,25 +434,49 @@ export async function refineWithGemini({
     extraRules.push(`- 추가 작성 지침: ${settings.geminiInstruction.trim()}`);
   }
 
-  const prompt = [
+  return [
     '당신은 대한민국 고등학교 교사입니다. 아래 학생의 자기평가 응답을 바탕으로 학교생활기록부 [세부능력 및 특기사항]을 작성해 주세요.',
     '',
     '작성 규칙:',
-    '1. 반드시 3인칭 관찰자 시점의 개조식/명사형 종결어미(~함., ~보임., ~드러냄., ~성장함.)로 작성할 것.',
+    `1. 반드시 3인칭 관찰자 시점의 ${toneGuide}로 작성할 것.`,
     '2. 학생 이름, 학교명, 사교육/외부 대회 등 NEIS 기재 금지 사항은 절대 포함하지 말 것.',
     '3. 학생이 작성한 핵심 개념, 활동, 이유, 발전시킨 능력을 누락 없이 자연스럽게 하나의 문단으로 연결할 것.',
     `4. 문체 스타일: ${styleLabel}`,
     `5. 분량: 공백 포함 한글 ${detailGuide} 이내 (1,500 Bytes 절대 초과 금지).`,
     ...extraRules,
-    '6. 부가 설명 없이 세특 본문만 출력할 것.',
+    '6. 인사말이나 부가 설명, 따옴표 감싸기 없이 세특 본문만 출력할 것.',
     '',
-    `과목명: ${course.title || '과학'}`,
+    `과목명: ${course?.title || '과학'}`,
     '학생 응답:',
     qaLines,
   ].join('\n');
+}
 
-  const model = settings.geminiModel || 'gemini-2.0-flash';
+function normalizeAiOutput(text) {
+  return String(text || '')
+    .replace(/^["'「『]+|["'」』]+$/g, '')
+    .replace(/\r?\n+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// ============================================================================
+// 1. Google Gemini API
+// ============================================================================
+
+export async function refineWithGemini({
+  apiKey,
+  course,
+  answers,
+  fields,
+  style,
+  aiSettings = {},
+}) {
+  const settings = { ...DEFAULT_AI_SETTINGS, ...(aiSettings || {}) };
+  const prompt = buildAiPrompt({ course, answers, fields, style, aiSettings: settings });
+  const model = settings.geminiModel || 'gemini-2.5-flash';
   const temperature = Number(settings.geminiTemperature ?? 0.5);
+
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
     model
   )}:generateContent?key=${encodeURIComponent(apiKey)}`;
@@ -455,7 +486,7 @@ export async function refineWithGemini({
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { temperature, maxOutputTokens: 700 },
+      generationConfig: { temperature, maxOutputTokens: 800 },
     }),
   });
 
@@ -465,9 +496,173 @@ export async function refineWithGemini({
   }
 
   const data = await res.json();
-  const output = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+  const output = data?.candidates?.[0]?.content?.parts?.[0]?.text;
   if (!output) {
-    throw new Error('AI 응답이 비어 있습니다.');
+    throw new Error('Gemini 응답이 비어 있습니다.');
   }
-  return output.replace(/\r?\n+/g, ' ').replace(/\s+/g, ' ').trim();
+  return normalizeAiOutput(output);
 }
+
+// ============================================================================
+// 2. Anthropic Claude API (Direct Browser Access enabled)
+// ============================================================================
+
+export async function refineWithClaude({
+  apiKey,
+  course,
+  answers,
+  fields,
+  style,
+  aiSettings = {},
+}) {
+  const settings = { ...DEFAULT_AI_SETTINGS, ...(aiSettings || {}) };
+  const prompt = buildAiPrompt({ course, answers, fields, style, aiSettings: settings });
+  const model = settings.claudeModel || 'claude-sonnet-4-20250514';
+  const temperature = Number(settings.geminiTemperature ?? 0.5);
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 900,
+      temperature,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Claude API 오류 (${res.status}): ${errText.slice(0, 180)}`);
+  }
+
+  const data = await res.json();
+  const output = Array.isArray(data?.content)
+    ? data.content
+        .filter((b) => b.type === 'text')
+        .map((b) => b.text)
+        .join(' ')
+    : '';
+  if (!output) {
+    throw new Error('Claude 응답이 비어 있습니다.');
+  }
+  return normalizeAiOutput(output);
+}
+
+// ============================================================================
+// 3. WebLLM (In-Browser Local LLM via WebGPU)
+// ============================================================================
+
+let webllmEngine = null;
+let webllmLoadedModel = null;
+let webllmLoading = false;
+let webllmProgressText = '';
+let webllmProgressPct = 0;
+
+export function isWebGpuSupported() {
+  return typeof navigator !== 'undefined' && Boolean(navigator.gpu);
+}
+
+export function getWebLlmState() {
+  return {
+    supported: isWebGpuSupported(),
+    loadedModel: webllmLoadedModel,
+    loading: webllmLoading,
+    progressText: webllmProgressText,
+    progressPct: webllmProgressPct,
+  };
+}
+
+export async function loadWebLlmModel(modelId, onProgress = null) {
+  if (!isWebGpuSupported()) {
+    throw new Error('현재 브라우저가 WebGPU를 지원하지 않습니다. 최신 Chrome 또는 Edge에서 사용해 주세요.');
+  }
+  if (webllmEngine && webllmLoadedModel === modelId) {
+    return webllmEngine;
+  }
+
+  webllmLoading = true;
+  webllmProgressPct = 0;
+  webllmProgressText = 'WebLLM 런타임 모듈을 불러오는 중...';
+  onProgress?.({ progress: 0, text: webllmProgressText });
+
+  try {
+    if (webllmEngine && typeof webllmEngine.unload === 'function') {
+      await webllmEngine.unload();
+      webllmEngine = null;
+      webllmLoadedModel = null;
+    }
+
+    const webllm = await import('https://esm.run/@mlc-ai/web-llm');
+    webllmEngine = await webllm.CreateMLCEngine(modelId, {
+      initProgressCallback: (report) => {
+        const pct = Math.round((report.progress || 0) * 100);
+        webllmProgressPct = pct;
+        webllmProgressText = report.text || `모델 불러오는 중... (${pct}%)`;
+        onProgress?.({ progress: pct, text: webllmProgressText });
+      },
+    });
+    webllmLoadedModel = modelId;
+    webllmProgressPct = 100;
+    webllmProgressText = '모델 준비 완료';
+    onProgress?.({ progress: 100, text: webllmProgressText });
+    return webllmEngine;
+  } catch (err) {
+    webllmEngine = null;
+    webllmLoadedModel = null;
+    throw new Error(`WebLLM 로드 실패: ${err.message || err}`);
+  } finally {
+    webllmLoading = false;
+  }
+}
+
+export async function unloadWebLlm() {
+  if (webllmEngine && typeof webllmEngine.unload === 'function') {
+    await webllmEngine.unload();
+  }
+  webllmEngine = null;
+  webllmLoadedModel = null;
+  webllmProgressPct = 0;
+  webllmProgressText = '';
+}
+
+export async function refineWithWebLlm({
+  course,
+  answers,
+  fields,
+  style,
+  aiSettings = {},
+  onProgress = null,
+}) {
+  const settings = { ...DEFAULT_AI_SETTINGS, ...(aiSettings || {}) };
+  const modelId = settings.webllmModel || 'Qwen2.5-3B-Instruct-q4f16_1-MLC';
+  const engine = await loadWebLlmModel(modelId, onProgress);
+
+  const prompt = buildAiPrompt({ course, answers, fields, style, aiSettings: settings });
+  const temperature = Number(settings.geminiTemperature ?? 0.5);
+
+  const reply = await engine.chat.completions.create({
+    messages: [
+      {
+        role: 'system',
+        content:
+          '당신은 대한민국 고등학교 교사이며 학교생활기록부 세부능력 및 특기사항을 NEIS 개조식 한국어(~함., ~보임.)로 작성합니다.',
+      },
+      { role: 'user', content: prompt },
+    ],
+    temperature,
+    max_tokens: 700,
+  });
+
+  const output = reply?.choices?.[0]?.message?.content;
+  if (!output) {
+    throw new Error('WebLLM 응답이 비어 있습니다.');
+  }
+  return normalizeAiOutput(output);
+}
+

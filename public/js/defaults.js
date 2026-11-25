@@ -111,6 +111,43 @@ export const AI_CLOSING_TEMPLATES = [
   { id: 'none', label: '추가 마무리 생략' },
 ];
 
+export const WEBLLM_MODELS = [
+  {
+    id: 'Qwen2.5-3B-Instruct-q4f16_1-MLC',
+    label: 'Qwen 2.5 3B (추천 · 한국어 우수 · ~2.0GB)',
+  },
+  {
+    id: 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC',
+    label: 'Qwen 2.5 1.5B (경량 · 빠른 로딩 · ~1.0GB)',
+  },
+  {
+    id: 'Qwen2.5-7B-Instruct-q4f16_1-MLC',
+    label: 'Qwen 2.5 7B (고품질 · 고사양 GPU 권장 · ~4.5GB)',
+  },
+  {
+    id: 'gemma-2-2b-it-q4f16_1-MLC',
+    label: 'Gemma 2 2B (Google 경량 · ~1.6GB)',
+  },
+  {
+    id: 'Llama-3.2-3B-Instruct-q4f16_1-MLC',
+    label: 'Llama 3.2 3B (Meta 경량 · ~2.0GB)',
+  },
+];
+
+export const GEMINI_MODELS = [
+  { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash (추천 · 빠르고 균형 잡힘)' },
+  { id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro (최고 품질 · 정교한 서술)' },
+  { id: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash (안정적 · 빠른 응답)' },
+  { id: 'gemini-2.0-flash-lite', label: 'Gemini 2.0 Flash-Lite (초경량 · 저비용)' },
+];
+
+export const CLAUDE_MODELS = [
+  { id: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4 (추천 · 자연스러운 한국어)' },
+  { id: 'claude-3-7-sonnet-20250219', label: 'Claude 3.7 Sonnet (정교한 문장 구성)' },
+  { id: 'claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet (안정적 품질)' },
+  { id: 'claude-3-5-haiku-20241022', label: 'Claude 3.5 Haiku (초고속 · 저비용)' },
+];
+
 export const DEFAULT_AI_SETTINGS = {
   defaultStyle: 'inquiry',
   detailLevel: 'standard',
@@ -120,7 +157,11 @@ export const DEFAULT_AI_SETTINGS = {
   autoFitNeisLimit: true,
   focusKeywords: '',
   closingTemplate: 'auto',
-  geminiModel: 'gemini-2.0-flash',
+  // Generative AI provider & models
+  activeAiProvider: 'gemini', // 'webllm' | 'gemini' | 'claude'
+  webllmModel: 'Qwen2.5-3B-Instruct-q4f16_1-MLC',
+  geminiModel: 'gemini-2.5-flash',
+  claudeModel: 'claude-sonnet-4-20250514',
   geminiTemperature: 0.5,
   geminiInstruction: '',
 };
