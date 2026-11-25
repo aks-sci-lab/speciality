@@ -11,6 +11,7 @@ import {
   WEBLLM_MODELS,
 } from './defaults.js';
 import {
+  buildAiPrompt,
   calcNeisBytes,
   generateSeteuk,
   getWebLlmState,
@@ -21,7 +22,18 @@ import {
   refineWithWebLlm,
   unloadWebLlm,
 } from './generator.js';
-import { api, encodeCourseConfig, getAiSettings, saveAiSettings } from './storage.js';
+import {
+  api,
+  buildGasUrlFromId,
+  encodeCourseConfig,
+  extractGasScriptId,
+  getAiSettings,
+  getGasUrl,
+  saveAiSettings,
+  setGasUrl,
+  setRuntimeGasUrl,
+  testGasConnection,
+} from './storage.js';
 
 // ============================================================================
 // Utilities
@@ -116,7 +128,10 @@ function buildStudentUrl(course, customOrigin, includeCfg = false) {
   const base = (customOrigin || getPreferredOrigin()).replace(/\/+$/, '');
   const courseId = typeof course === 'string' ? course : course.id;
   let url = `${base}/?course=${encodeURIComponent(courseId)}`;
-  if (includeCfg && typeof course === 'object') {
+  const gasScriptId = extractGasScriptId(getGasUrl());
+  if (gasScriptId) {
+    url += `&gs=${encodeURIComponent(gasScriptId)}`;
+  } else if (includeCfg && typeof course === 'object') {
     url += `&cfg=${encodeURIComponent(encodeCourseConfig(course))}`;
   }
   return url;
@@ -129,8 +144,12 @@ function buildStudentUrl(course, customOrigin, includeCfg = false) {
 const params = new URLSearchParams(window.location.search);
 const studentCourseId = params.get('course');
 const studentCfgParam = params.get('cfg');
+const studentGsParam = params.get('gs');
 
 if (studentCourseId) {
+  if (studentGsParam) {
+    setRuntimeGasUrl(buildGasUrlFromId(studentGsParam));
+  }
   initStudentApp(studentCourseId, studentCfgParam);
 } else {
   initTeacherApp();
@@ -345,6 +364,16 @@ const state = {
   // Local draft for builder tab
   builderDraft: null,
   isGeneratingAi: false,
+  aiProgressLabel: '',
+  storageMode: 'local', // 'sheets' | 'server' | 'local'
+  cliStatus: {
+    available: false,
+    providers: {
+      claude: { installed: false },
+      gemini: { installed: false },
+      codex: { installed: false },
+    },
+  },
 };
 
 function getActiveCourse() {
@@ -357,7 +386,13 @@ function getSelectedSubmission() {
 
 async function initTeacherApp() {
   try {
-    const courses = await api.listCourses();
+    const [storageMode, cliStatus, courses] = await Promise.all([
+      api.getStorageMode(),
+      api.getCliStatus(),
+      api.listCourses(),
+    ]);
+    state.storageMode = storageMode;
+    state.cliStatus = cliStatus;
     state.courses = courses;
     if (courses.length > 0) {
       await selectCourse(courses[0].id);
@@ -394,6 +429,7 @@ async function selectCourse(courseId, keepTab = false) {
 
 function renderTeacherApp() {
   const course = getActiveCourse();
+  const isSheetsConnected = Boolean(getGasUrl());
 
   const courseListHtml = state.courses
     .map((c) => {
@@ -420,12 +456,19 @@ function renderTeacherApp() {
           <div class="brand-mark" aria-hidden="true">세</div>
           <div class="brand-text">
             <span class="brand-title">세특 수집기</span>
-            <span class="brand-sub">Speciality · 교사 관리</span>
+            <span class="brand-sub">Speciality · ${
+              isSheetsConnected ? 'Google 시트 연동됨' : state.cliStatus.available ? '로컬 서버' : '교사 관리'
+            }</span>
           </div>
         </div>
         <div class="topbar-actions">
+          <button id="open-sheets-modal-btn" type="button" class="btn ${
+            isSheetsConnected ? 'btn-soft' : 'btn-secondary'
+          } btn-sm">
+            Google 시트${isSheetsConnected ? ' ●' : ' 연동'}
+          </button>
           <button id="open-ai-settings-btn" type="button" class="btn btn-secondary btn-sm">
-            내장 AI 설정
+            AI · CLI 설정
           </button>
           <button id="open-new-course-btn" type="button" class="btn btn-primary btn-sm">
             + 새 과목 만들기
@@ -667,16 +710,18 @@ function renderSubmissionDetailHtml(course, sub) {
 
   const aiSettings = getAiSettings();
   const provider = aiSettings.activeAiProvider || 'gemini';
-  const webllmStatus = getWebLlmState();
+  const cliProviders = state.cliStatus?.providers || {};
+  const labelMap = {
+    cli_claude: 'Claude CLI 다듬기',
+    cli_gemini: 'Gemini CLI 다듬기',
+    cli_codex: 'Codex CLI 다듬기',
+    webllm: 'WebLLM 다듬기',
+    claude: 'Claude 다듬기',
+    gemini: 'Gemini 다듬기',
+  };
   const aiBtnLabel = state.isGeneratingAi
     ? state.aiProgressLabel || 'AI 다듬는 중...'
-    : provider === 'webllm'
-    ? webllmStatus.loadedModel
-      ? 'WebLLM 다듬기'
-      : 'WebLLM 다듬기'
-    : provider === 'claude'
-    ? 'Claude 다듬기'
-    : 'Gemini 다듬기';
+    : labelMap[provider] || 'AI 다듬기';
 
   return `
     <article class="panel seteuk-card">
@@ -718,9 +763,28 @@ function renderSubmissionDetailHtml(course, sub) {
             내장 엔진 재작성
           </button>
           <select id="ai-provider-select" class="select" style="width:auto;padding:5px 10px;font-size:13px;" aria-label="생성형 AI 선택">
-            <option value="webllm"${provider === 'webllm' ? ' selected' : ''}>WebLLM (로컬)</option>
-            <option value="gemini"${provider === 'gemini' ? ' selected' : ''}>Gemini API</option>
-            <option value="claude"${provider === 'claude' ? ' selected' : ''}>Claude API</option>
+            ${
+              state.cliStatus?.available
+                ? `
+              <optgroup label="로컬 CLI (구독 로그인)">
+                <option value="cli_claude"${provider === 'cli_claude' ? ' selected' : ''}>Claude Code CLI${
+                    cliProviders.claude?.installed ? '' : ' (미설치)'
+                  }</option>
+                <option value="cli_gemini"${provider === 'cli_gemini' ? ' selected' : ''}>Gemini CLI${
+                    cliProviders.gemini?.installed ? '' : ' (미설치)'
+                  }</option>
+                <option value="cli_codex"${provider === 'cli_codex' ? ' selected' : ''}>GPT Codex CLI${
+                    cliProviders.codex?.installed ? '' : ' (미설치)'
+                  }</option>
+              </optgroup>
+            `
+                : ''
+            }
+            <optgroup label="브라우저 · API">
+              <option value="webllm"${provider === 'webllm' ? ' selected' : ''}>WebLLM (로컬)</option>
+              <option value="gemini"${provider === 'gemini' ? ' selected' : ''}>Gemini API</option>
+              <option value="claude"${provider === 'claude' ? ' selected' : ''}>Claude API</option>
+            </optgroup>
           </select>
           <button id="ai-refine-btn" type="button" class="btn btn-secondary btn-sm" ${
             state.isGeneratingAi ? 'disabled' : ''
@@ -904,7 +968,8 @@ function bindTeacherEvents() {
   // Topbar actions
   document.getElementById('open-new-course-btn')?.addEventListener('click', openNewCourseModal);
   document.getElementById('empty-new-course-btn')?.addEventListener('click', openNewCourseModal);
-  document.getElementById('open-ai-settings-btn')?.addEventListener('click', openAiSettingsModal);
+  document.getElementById('open-ai-settings-btn')?.addEventListener('click', () => openAiSettingsModal('builtin'));
+  document.getElementById('open-sheets-modal-btn')?.addEventListener('click', openSheetsModal);
 
   // Course sidebar switching
   document.querySelectorAll('[data-select-course]').forEach((btn) => {
@@ -1114,6 +1179,19 @@ function bindSubmissionsEvents() {
     const provider = aiSettings.activeAiProvider || 'gemini';
     const style = sub.style || aiSettings.defaultStyle || 'inquiry';
 
+    if (provider.startsWith('cli_')) {
+      const cliName = provider.replace('cli_', '');
+      if (!state.cliStatus?.available) {
+        showToast('로컬 CLI는 내 PC에서 npm start로 실행했을 때 사용할 수 있습니다.', 'error');
+        openAiSettingsModal('cli');
+        return;
+      }
+      if (!state.cliStatus.providers?.[cliName]?.installed) {
+        showToast(`${cliName} CLI가 이 PC에 설치되어 있지 않습니다.`, 'error');
+        openAiSettingsModal('cli');
+        return;
+      }
+    }
     if (provider === 'gemini' && !getGeminiKey()) {
       showToast('Gemini API 키를 먼저 입력해 주세요.', 'error');
       openAiSettingsModal('api');
@@ -1127,7 +1205,13 @@ function bindSubmissionsEvents() {
 
     state.isGeneratingAi = true;
     state.aiProgressLabel =
-      provider === 'webllm'
+      provider === 'cli_claude'
+        ? 'Claude CLI 작성 중...'
+        : provider === 'cli_gemini'
+        ? 'Gemini CLI 작성 중...'
+        : provider === 'cli_codex'
+        ? 'Codex CLI 작성 중...'
+        : provider === 'webllm'
         ? 'WebLLM 준비 중...'
         : provider === 'claude'
         ? 'Claude 생성 중...'
@@ -1136,7 +1220,17 @@ function bindSubmissionsEvents() {
 
     try {
       let refined = '';
-      if (provider === 'webllm') {
+      if (provider.startsWith('cli_')) {
+        const cliName = provider.replace('cli_', '');
+        const prompt = buildAiPrompt({
+          course,
+          answers: sub.answers,
+          fields: course.fields,
+          style,
+          aiSettings,
+        });
+        refined = await api.refineWithLocalCli({ provider: cliName, prompt });
+      } else if (provider === 'webllm') {
         refined = await refineWithWebLlm({
           course,
           answers: sub.answers,
@@ -1174,8 +1268,15 @@ function bindSubmissionsEvents() {
         status: 'auto',
       });
       replaceLocalSubmission(updated);
-      const label = provider === 'webllm' ? 'WebLLM' : provider === 'claude' ? 'Claude' : 'Gemini';
-      showToast(`${label}로 세특 문장을 자연스럽게 다듬었습니다.`);
+      const doneLabels = {
+        cli_claude: 'Claude Code CLI',
+        cli_gemini: 'Gemini CLI',
+        cli_codex: 'Codex CLI',
+        webllm: 'WebLLM',
+        claude: 'Claude API',
+        gemini: 'Gemini API',
+      };
+      showToast(`${doneLabels[provider] || 'AI'}로 세특 문장을 자연스럽게 다듬었습니다.`);
     } catch (err) {
       showToast(err.message || 'AI 다듬기에 실패했습니다.', 'error');
     } finally {
@@ -1740,8 +1841,11 @@ function openAiSettingsModal(initialTab = 'builtin') {
             <button type="button" class="modal-tab-btn${activeTab === 'builtin' ? ' active' : ''}" data-ai-tab="builtin">
               내장 규칙 엔진
             </button>
+            <button type="button" class="modal-tab-btn${activeTab === 'cli' ? ' active' : ''}" data-ai-tab="cli">
+              로컬 CLI (구독)${state.cliStatus?.available ? ' ●' : ''}
+            </button>
             <button type="button" class="modal-tab-btn${activeTab === 'webllm' ? ' active' : ''}" data-ai-tab="webllm">
-              WebLLM (로컬 AI)${webllmDot}
+              WebLLM (로컬)${webllmDot}
             </button>
             <button type="button" class="modal-tab-btn${activeTab === 'api' ? ' active' : ''}" data-ai-tab="api">
               Claude · Gemini API${apiDot}
@@ -1839,6 +1943,71 @@ function openAiSettingsModal(initialTab = 'builtin') {
                 `
                     : ''
                 }
+              `
+                  : activeTab === 'cli'
+                  ? `
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+                  <p style="font-size:13.5px;color:var(--text-secondary);flex:1;">
+                    내 PC에서 <code>npm start</code>로 실행한 상태에서, 이미 구독·로그인된 <strong>Claude Code / Gemini CLI / Codex CLI</strong>를 추가 API 비용 없이 바로 호출합니다.
+                  </p>
+                  <span class="badge ${state.cliStatus?.available ? 'badge-success' : 'badge-muted'}">
+                    ${state.cliStatus?.available ? '로컬 서버 연결됨' : '정적 웹 모드 (GitHub Pages)'}
+                  </span>
+                </div>
+
+                <div class="cli-cards-grid">
+                  ${[
+                    { key: 'claude', provider: 'cli_claude', name: 'Claude Code', cmd: 'claude', hint: 'Claude Pro/Max 구독' },
+                    { key: 'gemini', provider: 'cli_gemini', name: 'Gemini CLI', cmd: 'gemini', hint: 'Google 계정 로그인' },
+                    { key: 'codex', provider: 'cli_codex', name: 'GPT (Codex)', cmd: 'codex', hint: 'ChatGPT Plus/Pro 구독' },
+                  ]
+                    .map((item) => {
+                      const info = state.cliStatus?.providers?.[item.key];
+                      const ready = Boolean(state.cliStatus?.available && info?.installed);
+                      const isSelected = draft.activeAiProvider === item.provider;
+                      return `
+                        <div class="cli-card${ready ? ' ready' : ''}">
+                          <div class="cli-card-title">${item.name}</div>
+                          <div class="cli-card-sub">
+                            ${
+                              ready
+                                ? '설치 확인됨 · 사용 가능'
+                                : state.cliStatus?.available
+                                ? `미설치 (${item.cmd} CLI 필요)`
+                                : item.hint
+                            }
+                          </div>
+                          <button
+                            type="button"
+                            class="btn ${isSelected ? 'btn-primary' : 'btn-secondary'} btn-sm"
+                            data-select-cli="${item.provider}"
+                            ${ready ? '' : 'disabled'}
+                          >
+                            ${isSelected ? '기본 AI 선택됨' : '기본 AI로 사용'}
+                          </button>
+                        </div>
+                      `;
+                    })
+                    .join('')}
+                </div>
+
+                <div class="ai-preview-box">
+                  <div class="ai-preview-head">
+                    <span>로컬 PC 실행 및 Google Drive 연동 흐름</span>
+                  </div>
+                  <ol class="setup-steps">
+                    <li>내 PC에서 저장소를 내려받고 터미널에서 <code>npm install && npm start</code>를 실행합니다.</li>
+                    <li>상단 <strong>Google 시트 연동</strong>을 연결해 두면, 학생들은 GitHub Pages QR코드로 스마트폰에서 제출하고, 교사는 내 PC 로컬 CLI(무료/구독)로 세특을 작성해 구글 드라이브 시트에 자동 저장합니다.</li>
+                    <li>집·학교 어느 PC에서도 Google Drive에서 해당 구글 시트를 열면 최신 세특을 바로 확인할 수 있습니다.</li>
+                  </ol>
+                </div>
+
+                <div class="field-group">
+                  <label for="ai-instruction">추가 작성 지침 (로컬 CLI · WebLLM · API 공통)</label>
+                  <textarea id="ai-instruction" class="textarea" rows="2" placeholder="예: 실험 과정의 오차 분석과 과학적 탐구 태도를 자연스럽게 강조해 주세요.">${escapeHtml(
+                    draft.geminiInstruction || ''
+                  )}</textarea>
+                </div>
               `
                   : activeTab === 'webllm'
                   ? `
@@ -2116,6 +2285,15 @@ function openAiSettingsModal(initialTab = 'builtin') {
       draft.claudeModel = e.target.value;
     });
 
+    // Local CLI tab bindings
+    document.querySelectorAll('[data-select-cli]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        draft.activeAiProvider = btn.getAttribute('data-select-cli');
+        renderModal();
+        showToast('기본 생성형 AI를 선택한 로컬 CLI로 지정했습니다.');
+      });
+    });
+
     // Shared Temperature & Instruction bindings
     document.getElementById('ai-temp-range')?.addEventListener('input', (e) => {
       draft.geminiTemperature = Number(e.target.value);
@@ -2160,4 +2338,123 @@ function openAiSettingsModal(initialTab = 'builtin') {
   };
 
   renderModal();
+}
+
+function openSheetsModal() {
+  const currentUrl = getGasUrl();
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" id="modal-backdrop">
+      <div class="modal-dialog ai-modal" role="dialog" aria-modal="true" aria-labelledby="sheets-modal-title">
+        <div class="modal-head">
+          <h3 id="sheets-modal-title">Google 드라이브(스프레드시트) 실시간 연동</h3>
+          <button type="button" class="btn btn-ghost btn-icon" id="modal-close-btn">✕</button>
+        </div>
+        <form id="sheets-settings-form">
+          <div class="modal-body">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+              <p style="font-size:13.5px;color:var(--text-secondary);flex:1;">
+                교사의 Google 드라이브 스프레드시트를 연동하면 <strong>학생 스마트폰 QR 제출 → 구글 시트 실시간 수집 → 교사 PC(로컬 CLI/AI) 세특 자동 작성 → 구글 시트 저장</strong>이 연결되어 어느 PC에서도 구글 로그인만으로 결과를 확인할 수 있습니다.
+              </p>
+              <span class="badge ${currentUrl ? 'badge-success' : 'badge-muted'}">
+                ${currentUrl ? '연동됨' : '미연동'}
+              </span>
+            </div>
+
+            <div class="ai-preview-box">
+              <div class="ai-preview-head">
+                <span>3단계 초기 설정 (최초 1회만 진행)</span>
+                <button type="button" id="copy-gas-code-btn" class="btn btn-soft btn-sm">
+                  Apps Script 코드 복사
+                </button>
+              </div>
+              <ol class="setup-steps">
+                <li><strong>Google Drive</strong>에서 새 <strong>Google 스프레드시트</strong>를 만든 뒤, 상단 메뉴 <code>확장 프로그램 → Apps Script</code>를 엽니다.</li>
+                <li>기존 코드를 모두 지우고 위 <strong>Apps Script 코드 복사</strong> 버튼으로 복사한 코드를 붙여넣고 저장(<code>Ctrl+S</code>)합니다.</li>
+                <li>우측 상단 <code>배포 → 새 배포 → 유형: 웹 앱</code>에서 <strong>액세스 권한: 모든 사용자</strong>로 배포한 뒤 생성된 <code>https://script.google.com/macros/s/.../exec</code> URL을 아래에 붙여넣으세요.</li>
+              </ol>
+            </div>
+
+            <div class="field-group">
+              <label for="gas-url-input">Google Apps Script 웹 앱 URL</label>
+              <input
+                id="gas-url-input"
+                type="url"
+                class="input"
+                value="${escapeHtml(currentUrl)}"
+                placeholder="https://script.google.com/macros/s/AKfycb.../exec"
+                autocomplete="off"
+              />
+            </div>
+
+            <p style="font-size:12px;color:var(--text-muted);">
+              * 연동 후 생성하는 QR코드에는 시트 ID(<code>?gs=...</code>)가 자동으로 포함되어 학생들이 스마트폰(LTE/5G)으로 바로 구글 시트에 제출할 수 있습니다. 과목별 읽기 전용 탭도 시트 안에 자동 정리됩니다.
+            </p>
+          </div>
+          <div class="modal-foot" style="justify-content:space-between;">
+            ${
+              currentUrl
+                ? '<button type="button" class="btn btn-danger-soft btn-sm" id="disconnect-gas-btn">연동 해제</button>'
+                : '<span></span>'
+            }
+            <div style="display:flex;gap:8px;">
+              <button type="button" class="btn btn-secondary" id="modal-cancel-btn">취소</button>
+              <button type="submit" id="save-gas-btn" class="btn btn-primary">연결 테스트 및 저장</button>
+            </div>
+          </div>
+        </form>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('modal-close-btn')?.addEventListener('click', closeModal);
+  document.getElementById('modal-cancel-btn')?.addEventListener('click', closeModal);
+  document.getElementById('modal-backdrop')?.addEventListener('click', (e) => {
+    if (e.target.id === 'modal-backdrop') closeModal();
+  });
+
+  document.getElementById('copy-gas-code-btn')?.addEventListener('click', async () => {
+    try {
+      const res = await fetch('./apps-script-code.txt');
+      if (!res.ok) throw new Error('코드 파일을 불러오지 못했습니다.');
+      const code = await res.text();
+      await navigator.clipboard.writeText(code);
+      showToast('Apps Script 코드(Code.gs)를 클립보드에 복사했습니다.');
+    } catch (err) {
+      showToast(err.message || '복사에 실패했습니다.', 'error');
+    }
+  });
+
+  document.getElementById('disconnect-gas-btn')?.addEventListener('click', async () => {
+    setGasUrl('');
+    closeModal();
+    await initTeacherApp();
+    showToast('Google 시트 연동을 해제했습니다.');
+  });
+
+  document.getElementById('sheets-settings-form')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const url = document.getElementById('gas-url-input').value.trim();
+    const saveBtn = document.getElementById('save-gas-btn');
+    if (!url) {
+      setGasUrl('');
+      closeModal();
+      await initTeacherApp();
+      showToast('Google 시트 연동을 해제했습니다.');
+      return;
+    }
+
+    saveBtn.disabled = true;
+    saveBtn.textContent = '연결 확인 중...';
+    try {
+      const result = await testGasConnection(url);
+      setGasUrl(url);
+      closeModal();
+      await initTeacherApp();
+      showToast(`'${result.spreadsheetName || 'Google 시트'}'와 성공적으로 연동되었습니다!`);
+    } catch (err) {
+      showToast(err.message || '연결에 실패했습니다. 웹 앱 권한(모든 사용자)을 확인해 주세요.', 'error');
+      saveBtn.disabled = false;
+      saveBtn.textContent = '연결 테스트 및 저장';
+    }
+  });
 }

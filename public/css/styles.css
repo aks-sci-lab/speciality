@@ -1520,3 +1520,59 @@ p {
   border-color: var(--primary);
   color: var(--primary);
 }
+
+/* ==========================================================================
+   Local CLI Cards & Google Sheets Setup Guide
+   ========================================================================== */
+
+.cli-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.cli-card {
+  border: 1px solid var(--border);
+  background-color: var(--bg-elevated);
+  border-radius: var(--radius-md);
+  padding: 13px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cli-card.ready {
+  background-color: var(--success-soft);
+  border-color: rgba(21, 122, 66, 0.28);
+}
+
+.cli-card-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.cli-card-sub {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.setup-steps {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13.5px;
+  color: var(--text-secondary);
+}
+
+.setup-steps strong {
+  color: var(--text);
+}
+
+@media (max-width: 640px) {
+  .cli-cards-grid {
+    grid-template-columns: 1fr;
+  }
+}

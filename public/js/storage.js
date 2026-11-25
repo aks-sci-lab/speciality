@@ -1,8 +1,9 @@
 /**
- * Hybrid API + Static (GitHub Pages) storage client for Speciality 세특 수집 웹앱
- * - Automatically detects Node.js backend (/api/health)
- * - Falls back seamlessly to localStorage + compact URL-encoded course config on GitHub Pages
- * - Renders crisp QR codes locally via self-hosted qrcode.mjs (zero external CDN dependency)
+ * 3-Tier Hybrid Storage Client for Speciality 세특 수집 웹앱
+ * 1. Google Sheets (Apps Script Web App URL) — real-time cross-device sync (student QR -> Google Drive Sheet -> teacher PC)
+ * 2. Local Node.js Server (/api/*) — local storage + Local CLI (Claude Code / Gemini CLI / Codex CLI)
+ * 3. Browser localStorage — zero-setup static fallback
+ * + Self-hosted QR Code generator (public/js/vendor/qrcode.mjs)
  */
 
 import {
@@ -17,11 +18,46 @@ import qrcode from './vendor/qrcode.mjs';
 const LS_COURSES_KEY = 'speciality_v1_courses';
 const LS_SUBS_KEY = 'speciality_v1_submissions';
 const LS_AI_SETTINGS_KEY = 'speciality_v1_ai_settings';
+const LS_GAS_URL_KEY = 'speciality_v1_gas_url';
 
 const DEFAULT_DESCRIPTION =
   '한 학기 동안의 수업과 탐구 활동을 돌아보며 아래 항목을 성실하게 작성해 주세요.';
 
 let backendAvailable = null;
+let runtimeGasUrlOverride = null; // Used when student scans QR with ?gs=<scriptId>
+
+export function setRuntimeGasUrl(url) {
+  runtimeGasUrlOverride = url ? String(url).trim() : null;
+}
+
+export function getGasUrl() {
+  if (runtimeGasUrlOverride) return runtimeGasUrlOverride;
+  try {
+    return localStorage.getItem(LS_GAS_URL_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+export function setGasUrl(url) {
+  const clean = String(url || '').trim();
+  if (clean) {
+    localStorage.setItem(LS_GAS_URL_KEY, clean);
+  } else {
+    localStorage.removeItem(LS_GAS_URL_KEY);
+  }
+}
+
+export function extractGasScriptId(url) {
+  const m = String(url || '').match(/\/macros\/s\/([^/]+)\/exec/);
+  return m ? m[1] : '';
+}
+
+export function buildGasUrlFromId(scriptId) {
+  const clean = String(scriptId || '').trim();
+  if (!clean) return '';
+  return `https://script.google.com/macros/s/${encodeURIComponent(clean)}/exec`;
+}
 
 async function checkBackend() {
   if (backendAvailable !== null) return backendAvailable;
@@ -54,6 +90,40 @@ async function request(url, options = {}) {
   return data;
 }
 
+async function gasGet(url, params = {}) {
+  const u = new URL(url);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null) u.searchParams.set(k, String(v));
+  }
+  const res = await fetch(u.toString(), { method: 'GET', redirect: 'follow' });
+  const data = await res.json();
+  if (data?.error) throw new Error(data.error);
+  return data;
+}
+
+async function gasPost(url, bodyObj) {
+  // text/plain avoids CORS preflight on Google Apps Script Web Apps
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify(bodyObj),
+    redirect: 'follow',
+  });
+  const data = await res.json();
+  if (data?.error) throw new Error(data.error);
+  return data;
+}
+
+export async function testGasConnection(url) {
+  const clean = String(url || '').trim();
+  if (!clean.startsWith('https://script.google.com/macros/s/')) {
+    throw new Error('올바른 Google Apps Script 웹 앱 URL(https://script.google.com/macros/s/.../exec)을 입력해 주세요.');
+  }
+  const res = await gasGet(clean, { action: 'ping' });
+  if (!res?.ok) throw new Error('Apps Script 응답이 올바르지 않습니다.');
+  return res;
+}
+
 // ============================================================================
 // Built-in AI Settings persistence
 // ============================================================================
@@ -77,7 +147,7 @@ export function saveAiSettings(settings) {
 }
 
 // ============================================================================
-// LocalStorage helpers (GitHub Pages / static fallback)
+// LocalStorage helpers
 // ============================================================================
 
 function readLocalCourses() {
@@ -153,7 +223,6 @@ export function encodeCourseConfig(course) {
   if (course.description && course.description.trim() !== DEFAULT_DESCRIPTION) {
     minimal.d = course.description.trim();
   }
-  // Only include fields in QR URL if teacher customized them (keeps QR URL ultra-short!)
   if (!isUsingDefaultFields(course.fields)) {
     minimal.f = (course.fields || []).map((f) => {
       const item = {
@@ -216,7 +285,6 @@ export function decodeCourseConfig(encoded, fallbackId = 'course') {
 // ============================================================================
 
 function renderLocalQrDataUrl(text) {
-  // Use error correction 'M' for short URLs, 'L' for longer URLs so QR always fits cleanly
   const ecLevel = text.length > 260 ? 'L' : 'M';
   const qr = qrcode(0, ecLevel);
   qr.addData(text, 'Byte');
@@ -252,13 +320,73 @@ function renderLocalQrDataUrl(text) {
   return qr.createDataURL(6, 12);
 }
 
+// ============================================================================
+// Unified API Facade
+// ============================================================================
+
 export const api = {
+  async hasLocalServer() {
+    return checkBackend();
+  },
+
   async isStaticMode() {
+    if (getGasUrl()) return false;
     const hasBackend = await checkBackend();
     return !hasBackend;
   },
 
+  async getStorageMode() {
+    if (getGasUrl()) return 'sheets';
+    if (await checkBackend()) return 'server';
+    return 'local';
+  },
+
+  // Local CLI Bridge (works whenever local Node.js server is running, even with Google Sheets!)
+  async getCliStatus() {
+    if (!(await checkBackend())) {
+      return {
+        available: false,
+        providers: {
+          claude: { installed: false },
+          gemini: { installed: false },
+          codex: { installed: false },
+        },
+      };
+    }
+    try {
+      return await request('/api/cli/status');
+    } catch {
+      return {
+        available: false,
+        providers: {
+          claude: { installed: false },
+          gemini: { installed: false },
+          codex: { installed: false },
+        },
+      };
+    }
+  },
+
+  async refineWithLocalCli({ provider, prompt, model = '' }) {
+    if (!(await checkBackend())) {
+      throw new Error(
+        '로컬 CLI 기능은 내 PC에서 npm start로 서버를 실행했을 때 사용할 수 있습니다.'
+      );
+    }
+    const { text } = await request('/api/cli/refine', {
+      method: 'POST',
+      body: JSON.stringify({ provider, prompt, model }),
+    });
+    return text;
+  },
+
+  // Courses CRUD
   async listCourses() {
+    const gas = getGasUrl();
+    if (gas) {
+      const { courses } = await gasGet(gas, { action: 'listCourses' });
+      return Array.isArray(courses) ? courses : [];
+    }
     if (await checkBackend()) {
       const { courses } = await request('/api/courses');
       return courses;
@@ -272,6 +400,11 @@ export const api = {
   },
 
   async getCourse(courseId, cfgParam = null) {
+    const gas = getGasUrl();
+    if (gas) {
+      const { course } = await gasGet(gas, { action: 'getCourse', courseId });
+      if (course) return course;
+    }
     if (await checkBackend()) {
       const { course } = await request(`/api/courses/${encodeURIComponent(courseId)}`);
       return course;
@@ -286,6 +419,11 @@ export const api = {
   },
 
   async createCourse(payload) {
+    const gas = getGasUrl();
+    if (gas) {
+      const { course } = await gasPost(gas, { action: 'createCourse', payload });
+      return course;
+    }
     if (await checkBackend()) {
       const { course } = await request('/api/courses', {
         method: 'POST',
@@ -301,6 +439,11 @@ export const api = {
   },
 
   async updateCourse(courseId, payload) {
+    const gas = getGasUrl();
+    if (gas) {
+      const { course } = await gasPost(gas, { action: 'updateCourse', courseId, payload });
+      return course;
+    }
     if (await checkBackend()) {
       const { course } = await request(`/api/courses/${encodeURIComponent(courseId)}`, {
         method: 'PUT',
@@ -317,6 +460,10 @@ export const api = {
   },
 
   async deleteCourse(courseId) {
+    const gas = getGasUrl();
+    if (gas) {
+      return gasPost(gas, { action: 'deleteCourse', courseId });
+    }
     if (await checkBackend()) {
       return request(`/api/courses/${encodeURIComponent(courseId)}`, { method: 'DELETE' });
     }
@@ -325,7 +472,13 @@ export const api = {
     return { deleted: true };
   },
 
+  // Submissions CRUD
   async listSubmissions(courseId) {
+    const gas = getGasUrl();
+    if (gas) {
+      const { submissions } = await gasGet(gas, { action: 'listSubmissions', courseId });
+      return Array.isArray(submissions) ? submissions : [];
+    }
     if (await checkBackend()) {
       const { submissions } = await request(`/api/courses/${encodeURIComponent(courseId)}/submissions`);
       return submissions;
@@ -334,6 +487,28 @@ export const api = {
   },
 
   async submitStudentResponse(courseId, payload, courseFallback = null) {
+    const gas = getGasUrl();
+    if (gas) {
+      const aiSettings = getAiSettings();
+      const autoText = courseFallback
+        ? generateSeteuk({
+            answers: payload.answers || {},
+            fields: courseFallback.fields || [],
+            course: courseFallback,
+            style: aiSettings.defaultStyle,
+            aiSettings,
+          })
+        : '';
+      return gasPost(gas, {
+        action: 'submit',
+        courseId,
+        payload: {
+          ...payload,
+          generatedText: autoText,
+          style: aiSettings.defaultStyle || 'inquiry',
+        },
+      });
+    }
     if (await checkBackend()) {
       return request(`/api/courses/${encodeURIComponent(courseId)}/submissions`, {
         method: 'POST',
@@ -373,6 +548,15 @@ export const api = {
   },
 
   async updateSubmission(submissionId, payload) {
+    const gas = getGasUrl();
+    if (gas) {
+      const { submission } = await gasPost(gas, {
+        action: 'updateSubmission',
+        submissionId,
+        payload,
+      });
+      return submission;
+    }
     if (await checkBackend()) {
       const { submission } = await request(`/api/submissions/${encodeURIComponent(submissionId)}`, {
         method: 'PUT',
@@ -389,6 +573,10 @@ export const api = {
   },
 
   async deleteSubmission(submissionId) {
+    const gas = getGasUrl();
+    if (gas) {
+      return gasPost(gas, { action: 'deleteSubmission', submissionId });
+    }
     if (await checkBackend()) {
       return request(`/api/submissions/${encodeURIComponent(submissionId)}`, { method: 'DELETE' });
     }
@@ -397,6 +585,10 @@ export const api = {
   },
 
   async bulkUpdateSubmissions(updates) {
+    const gas = getGasUrl();
+    if (gas) {
+      return gasPost(gas, { action: 'bulkUpdateSubmissions', updates });
+    }
     if (await checkBackend()) {
       return request('/api/submissions/bulk-update', {
         method: 'POST',
@@ -413,7 +605,6 @@ export const api = {
   },
 
   async renderQrDataUrl(targetUrl) {
-    // Always works locally in browser (GitHub Pages & Node.js) with zero external network dependency!
     try {
       return renderLocalQrDataUrl(targetUrl);
     } catch (err) {

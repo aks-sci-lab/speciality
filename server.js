@@ -1,6 +1,7 @@
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
+import { execFile, spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import QRCode from 'qrcode';
 import { createCourseObject, cloneDefaultFields } from './public/js/defaults.js';
@@ -11,14 +12,16 @@ const __dirname = path.dirname(__filename);
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
 const STORE_PATH = path.join(DATA_DIR, 'store.json');
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.js': 'application/javascript; charset=utf-8',
+  '.mjs': 'application/javascript; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
+  '.txt': 'text/plain; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -139,6 +142,81 @@ function serveStatic(req, res, pathname) {
   });
 }
 
+function checkCliInstalled(cmd) {
+  return new Promise((resolve) => {
+    const checker = process.platform === 'win32' ? 'where' : 'which';
+    execFile(checker, [cmd], { timeout: 3000 }, (err, stdout) => {
+      if (err || !stdout.trim()) return resolve({ installed: false, path: '' });
+      resolve({ installed: true, path: stdout.trim().split(/\r?\n/)[0] });
+    });
+  });
+}
+
+function runLocalCli(provider, prompt, model = '') {
+  return new Promise((resolve, reject) => {
+    let cmd = '';
+    let args = [];
+
+    if (provider === 'claude') {
+      cmd = 'claude';
+      args = ['-p', prompt, '--output-format', 'text'];
+      if (model) args.push('--model', model);
+    } else if (provider === 'gemini') {
+      cmd = 'gemini';
+      args = ['-p', prompt];
+      if (model) args.push('-m', model);
+    } else if (provider === 'codex') {
+      cmd = 'codex';
+      args = ['exec', prompt];
+      if (model) args.push('-m', model);
+    } else {
+      return reject(new Error(`지원하지 않는 CLI 공급자입니다: ${provider}`));
+    }
+
+    const child = spawn(cmd, args, {
+      shell: process.platform === 'win32',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error(`${provider} CLI 응답 시간이 초과되었습니다 (90초).`));
+    }, 90000);
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf-8');
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf-8');
+    });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(new Error(`${cmd} CLI 실행 실패: ${err.message}`));
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        return reject(
+          new Error(
+            `${cmd} CLI 오류 (종료코드 ${code}): ${(stderr || stdout || '로그인 상태를 확인해 주세요.').trim().slice(0, 220)}`
+          )
+        );
+      }
+      const cleaned = stdout
+        .replace(/^["'「『]+|["'」』]+$/g, '')
+        .replace(/\r?\n+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!cleaned) {
+        return reject(new Error(`${cmd} CLI 출력이 비어 있습니다.`));
+      }
+      resolve(cleaned);
+    });
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   const urlObj = new URL(req.url, `http://${req.headers.host}`);
   const { pathname, searchParams } = urlObj;
@@ -148,7 +226,33 @@ const server = http.createServer(async (req, res) => {
     try {
       // Health check
       if (pathname === '/api/health' && method === 'GET') {
-        return sendJson(res, 200, { ok: true });
+        return sendJson(res, 200, { ok: true, mode: 'local-server' });
+      }
+
+      // Local CLI status check (Claude Code / Gemini CLI / Codex CLI)
+      if (pathname === '/api/cli/status' && method === 'GET') {
+        const [claude, gemini, codex] = await Promise.all([
+          checkCliInstalled('claude'),
+          checkCliInstalled('gemini'),
+          checkCliInstalled('codex'),
+        ]);
+        return sendJson(res, 200, {
+          available: true,
+          providers: { claude, gemini, codex },
+        });
+      }
+
+      // Local CLI refine using existing subscription login
+      if (pathname === '/api/cli/refine' && method === 'POST') {
+        const body = await parseBody(req);
+        const provider = String(body.provider || '').trim();
+        const prompt = String(body.prompt || '').trim();
+        const model = String(body.model || '').trim();
+        if (!provider || !prompt) {
+          return sendJson(res, 400, { error: 'provider와 prompt가 필요합니다.' });
+        }
+        const text = await runLocalCli(provider, prompt, model);
+        return sendJson(res, 200, { text });
       }
 
       // QR Code generator (SVG or PNG)
