@@ -93,6 +93,38 @@ export const GENERATION_STYLES = [
   },
 ];
 
+export const AI_DETAIL_LEVELS = [
+  { id: 'brief', label: '간결', description: '핵심 문장 위주 (약 450~700 Bytes)' },
+  { id: 'standard', label: '표준', description: '균형 잡힌 서술 (약 750~1,100 Bytes)' },
+  { id: 'detailed', label: '상세', description: '탐구 과정과 의미를 풍부하게 서술 (약 1,100~1,450 Bytes)' },
+];
+
+export const AI_ENDING_TONES = [
+  { id: 'standard', label: '표준 개조식 (~함. / ~보임.)' },
+  { id: 'competency', label: '역량 강조형 (~드러냄. / ~신장함.)' },
+  { id: 'growth', label: '성장 관찰형 (~성장함. / ~기대됨.)' },
+];
+
+export const AI_CLOSING_TEMPLATES = [
+  { id: 'auto', label: '자동 마무리 (문체에 맞춤)' },
+  { id: 'potential', label: '향후 발전 가능성 강조' },
+  { id: 'none', label: '추가 마무리 생략' },
+];
+
+export const DEFAULT_AI_SETTINGS = {
+  defaultStyle: 'inquiry',
+  detailLevel: 'standard',
+  endingTone: 'standard',
+  includeCourseTitle: true,
+  emphasizeMisconception: true,
+  autoFitNeisLimit: true,
+  focusKeywords: '',
+  closingTemplate: 'auto',
+  geminiModel: 'gemini-2.0-flash',
+  geminiTemperature: 0.5,
+  geminiInstruction: '',
+};
+
 export function cloneDefaultFields() {
   return DEFAULT_FIELDS.map((f) => ({ ...f, options: [...(f.options || [])] }));
 }

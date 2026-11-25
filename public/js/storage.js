@@ -1,15 +1,24 @@
 /**
  * Hybrid API + Static (GitHub Pages) storage client for Speciality 세특 수집 웹앱
  * - Automatically detects Node.js backend (/api/health)
- * - Falls back seamlessly to localStorage + URL-encoded course config on static hosts (GitHub Pages)
+ * - Falls back seamlessly to localStorage + compact URL-encoded course config on GitHub Pages
+ * - Renders crisp QR codes locally via self-hosted qrcode.mjs (zero external CDN dependency)
  */
 
-import { cloneDefaultFields, createCourseObject, DEFAULT_FIELDS } from './defaults.js';
+import {
+  cloneDefaultFields,
+  createCourseObject,
+  DEFAULT_AI_SETTINGS,
+  DEFAULT_FIELDS,
+} from './defaults.js';
 import { generateSeteuk } from './generator.js';
+import qrcode from './vendor/qrcode.mjs';
 
 const LS_COURSES_KEY = 'speciality_v1_courses';
 const LS_SUBS_KEY = 'speciality_v1_submissions';
-const DEFAULT_DESC =
+const LS_AI_SETTINGS_KEY = 'speciality_v1_ai_settings';
+
+const DEFAULT_DESCRIPTION =
   '한 학기 동안의 수업과 탐구 활동을 돌아보며 아래 항목을 성실하게 작성해 주세요.';
 
 let backendAvailable = null;
@@ -46,6 +55,28 @@ async function request(url, options = {}) {
 }
 
 // ============================================================================
+// Built-in AI Settings persistence
+// ============================================================================
+
+export function getAiSettings() {
+  try {
+    const raw = localStorage.getItem(LS_AI_SETTINGS_KEY);
+    if (raw) {
+      return { ...DEFAULT_AI_SETTINGS, ...JSON.parse(raw) };
+    }
+  } catch {
+    // ignore
+  }
+  return { ...DEFAULT_AI_SETTINGS };
+}
+
+export function saveAiSettings(settings) {
+  const merged = { ...DEFAULT_AI_SETTINGS, ...(settings || {}) };
+  localStorage.setItem(LS_AI_SETTINGS_KEY, JSON.stringify(merged));
+  return merged;
+}
+
+// ============================================================================
 // LocalStorage helpers (GitHub Pages / static fallback)
 // ============================================================================
 
@@ -63,7 +94,8 @@ function readLocalCourses() {
     createCourseObject({
       id: 'sci_lab_01',
       title: '과학탐구실험',
-      description: DEFAULT_DESC,
+      description:
+        '한 학기 동안의 수업과 탐구 활동을 돌아보며 아래 항목을 성실하게 작성해 주세요. 제출 내용은 수업 기록 참고 자료로 활용됩니다.',
       isJointCurriculum: false,
       isOpen: true,
       fields: cloneDefaultFields(),
@@ -94,7 +126,11 @@ function writeLocalSubs(subs) {
   localStorage.setItem(LS_SUBS_KEY, JSON.stringify(subs));
 }
 
-function isSameAsDefaultFields(fields) {
+// ============================================================================
+// Compact UTF-8 base64url encoder/decoder for low-density QR URLs
+// ============================================================================
+
+function isUsingDefaultFields(fields = []) {
   if (!Array.isArray(fields) || fields.length !== DEFAULT_FIELDS.length) return false;
   return fields.every((f, idx) => {
     const d = DEFAULT_FIELDS[idx];
@@ -103,35 +139,35 @@ function isSameAsDefaultFields(fields) {
       f.label === d.label &&
       f.type === d.type &&
       f.role === d.role &&
-      Boolean(f.required) === Boolean(d.required) &&
-      (f.placeholder || '') === (d.placeholder || '')
+      Boolean(f.required) === Boolean(d.required)
     );
   });
 }
 
-// UTF-8 safe compact base64url encode/decode for QR course config sharing in static mode
 export function encodeCourseConfig(course) {
   const minimal = {
     t: course.title,
     j: course.isJointCurriculum ? 1 : 0,
   };
-  if (course.description && course.description.trim() !== DEFAULT_DESC) {
+  if (course.isOpen === false) minimal.o = 0;
+  if (course.description && course.description.trim() !== DEFAULT_DESCRIPTION) {
     minimal.d = course.description.trim();
   }
-  if (course.isOpen === false) {
-    minimal.o = 0;
-  }
-  if (!isSameAsDefaultFields(course.fields)) {
+  // Only include fields in QR URL if teacher customized them (keeps QR URL ultra-short!)
+  if (!isUsingDefaultFields(course.fields)) {
     minimal.f = (course.fields || []).map((f) => {
-      const item = { i: f.id, l: f.label };
-      if (f.type && f.type !== 'textarea') item.y = f.type;
-      if (f.role && f.role !== 'custom') item.r = f.role;
-      if (f.required) item.q = 1;
-      if (f.placeholder) item.p = f.placeholder;
-      if (Array.isArray(f.options) && f.options.length > 0) item.o = f.options;
+      const item = {
+        i: f.id,
+        l: f.label,
+        y: f.type || 'textarea',
+        r: f.role || 'custom',
+        q: f.required ? 1 : 0,
+      };
+      if (f.options && f.options.length > 0) item.o = f.options;
       return item;
     });
   }
+
   const json = JSON.stringify(minimal);
   const bytes = new TextEncoder().encode(json);
   let bin = '';
@@ -141,7 +177,7 @@ export function encodeCourseConfig(course) {
   return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-export function decodeCourseConfig(encoded, fallbackId = '') {
+export function decodeCourseConfig(encoded, fallbackId = 'course') {
   try {
     const pad = encoded.length % 4 === 0 ? '' : '='.repeat(4 - (encoded.length % 4));
     const b64 = encoded.replace(/-/g, '+').replace(/_/g, '/') + pad;
@@ -149,17 +185,20 @@ export function decodeCourseConfig(encoded, fallbackId = '') {
     const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
     const json = new TextDecoder().decode(bytes);
     const m = JSON.parse(json);
+
+    const defaultById = new Map(DEFAULT_FIELDS.map((d) => [d.id, d]));
+
     return {
       id: m.id || fallbackId,
       title: m.t || '수집 과목',
-      description: m.d !== undefined ? m.d : DEFAULT_DESC,
+      description: m.d !== undefined ? m.d : DEFAULT_DESCRIPTION,
       isJointCurriculum: Boolean(m.j),
       isOpen: m.o !== 0,
       fields: Array.isArray(m.f)
         ? m.f.map((f) => ({
             id: f.i,
             label: f.l,
-            placeholder: f.p || '',
+            placeholder: f.p || defaultById.get(f.i)?.placeholder || '',
             type: f.y || 'textarea',
             role: f.r || 'custom',
             required: Boolean(f.q),
@@ -170,6 +209,47 @@ export function decodeCourseConfig(encoded, fallbackId = '') {
   } catch {
     return null;
   }
+}
+
+// ============================================================================
+// Self-hosted Browser QR Code PNG Data URL Generator (Zero CDN)
+// ============================================================================
+
+function renderLocalQrDataUrl(text) {
+  // Use error correction 'M' for short URLs, 'L' for longer URLs so QR always fits cleanly
+  const ecLevel = text.length > 260 ? 'L' : 'M';
+  const qr = qrcode(0, ecLevel);
+  qr.addData(text, 'Byte');
+  qr.make();
+
+  const moduleCount = qr.getModuleCount();
+  const quietZone = 3;
+  const totalModules = moduleCount + quietZone * 2;
+  const targetSize = 512;
+  const cellSize = Math.max(4, Math.floor(targetSize / totalModules));
+  const canvasSize = totalModules * cellSize;
+
+  if (typeof document !== 'undefined') {
+    const canvas = document.createElement('canvas');
+    canvas.width = canvasSize;
+    canvas.height = canvasSize;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, canvasSize, canvasSize);
+      ctx.fillStyle = '#142927';
+      for (let r = 0; r < moduleCount; r += 1) {
+        for (let c = 0; c < moduleCount; c += 1) {
+          if (qr.isDark(r, c)) {
+            ctx.fillRect((c + quietZone) * cellSize, (r + quietZone) * cellSize, cellSize, cellSize);
+          }
+        }
+      }
+      return canvas.toDataURL('image/png');
+    }
+  }
+
+  return qr.createDataURL(6, 12);
 }
 
 export const api = {
@@ -264,12 +344,14 @@ export const api = {
     if (!course) throw new Error('과목 정보를 찾을 수 없습니다.');
     if (!course.isOpen) throw new Error('현재 제출이 마감된 과목입니다.');
 
+    const aiSettings = getAiSettings();
     const now = new Date().toISOString();
     const autoText = generateSeteuk({
       answers: payload.answers || {},
       fields: course.fields || [],
       course,
-      style: 'inquiry',
+      style: aiSettings.defaultStyle,
+      aiSettings,
     });
 
     const subs = readLocalSubs();
@@ -281,7 +363,7 @@ export const api = {
       school: course.isJointCurriculum ? String(payload.school || '').trim() : '',
       answers: payload.answers || {},
       generatedText: autoText,
-      style: 'inquiry',
+      style: aiSettings.defaultStyle || 'inquiry',
       status: 'auto',
       createdAt: now,
       updatedAt: now,
@@ -331,38 +413,15 @@ export const api = {
   },
 
   async renderQrDataUrl(targetUrl) {
-    if (await checkBackend()) {
-      return `/api/qr?format=png&text=${encodeURIComponent(targetUrl)}`;
-    }
-    if (typeof window !== 'undefined' && typeof window.qrcode === 'function') {
-      const ecLevel = targetUrl.length > 500 ? 'L' : 'M';
-      const qr = window.qrcode(0, ecLevel);
-      qr.addData(targetUrl, 'Byte');
-      qr.make();
-
-      const count = qr.getModuleCount();
-      const margin = 4;
-      const targetSize = 512;
-      const cell = Math.max(2, Math.floor(targetSize / (count + margin * 2)));
-      const size = cell * (count + margin * 2);
-
-      const canvas = document.createElement('canvas');
-      canvas.width = size;
-      canvas.height = size;
-      const ctx = canvas.getContext('2d');
-      ctx.fillStyle = '#FFFFFF';
-      ctx.fillRect(0, 0, size, size);
-      ctx.fillStyle = '#142927';
-
-      for (let r = 0; r < count; r += 1) {
-        for (let c = 0; c < count; c += 1) {
-          if (qr.isDark(r, c)) {
-            ctx.fillRect((c + margin) * cell, (r + margin) * cell, cell, cell);
-          }
-        }
+    // Always works locally in browser (GitHub Pages & Node.js) with zero external network dependency!
+    try {
+      return renderLocalQrDataUrl(targetUrl);
+    } catch (err) {
+      console.error('Local QR generation failed, falling back to /api/qr:', err);
+      if (await checkBackend()) {
+        return `/api/qr?format=png&text=${encodeURIComponent(targetUrl)}`;
       }
-      return canvas.toDataURL('image/png');
+      throw err;
     }
-    return '';
   },
 };

@@ -1,5 +1,9 @@
 import {
+  AI_CLOSING_TEMPLATES,
+  AI_DETAIL_LEVELS,
+  AI_ENDING_TONES,
   cloneDefaultFields,
+  DEFAULT_AI_SETTINGS,
   FIELD_ROLES,
   GENERATION_STYLES,
 } from './defaults.js';
@@ -9,7 +13,7 @@ import {
   NEIS_BYTE_LIMIT,
   refineWithGemini,
 } from './generator.js';
-import { api, encodeCourseConfig } from './storage.js';
+import { api, encodeCourseConfig, getAiSettings, saveAiSettings } from './storage.js';
 
 // ============================================================================
 // Utilities
@@ -399,8 +403,8 @@ function renderTeacherApp() {
           </div>
         </div>
         <div class="topbar-actions">
-          <button id="open-ai-settings-btn" type="button" class="btn btn-ghost btn-sm">
-            AI 설정${getGeminiKey() ? ' ●' : ''}
+          <button id="open-ai-settings-btn" type="button" class="btn btn-secondary btn-sm">
+            내장 AI 설정
           </button>
           <button id="open-new-course-btn" type="button" class="btn btn-primary btn-sm">
             + 새 과목 만들기
@@ -958,19 +962,21 @@ function bindSubmissionsEvents() {
   document.getElementById('bulk-regen-btn')?.addEventListener('click', async () => {
     if (!confirm('현재 과목의 모든 학생 세특을 자동 생성 문구로 다시 작성할까요?')) return;
     try {
+      const aiSettings = getAiSettings();
       const updates = state.submissions.map((sub) => {
-        const style = sub.style || 'inquiry';
+        const style = sub.style || aiSettings.defaultStyle || 'inquiry';
         const generatedText = generateSeteuk({
           answers: sub.answers,
           fields: course.fields,
           course,
           style,
+          aiSettings,
         });
         return { id: sub.id, generatedText, style, status: 'auto' };
       });
       await api.bulkUpdateSubmissions(updates);
       await selectCourse(course.id, true);
-      showToast(`${updates.length}명의 세특을 일괄 다시 생성했습니다.`);
+      showToast(`${updates.length}명의 세특을 현재 내장 AI 설정으로 다시 생성했습니다.`);
     } catch (err) {
       showToast(err.message, 'error');
     }
@@ -1019,6 +1025,7 @@ function bindSubmissionsEvents() {
         fields: course.fields,
         course,
         style,
+        aiSettings: getAiSettings(),
       });
       try {
         const updated = await api.updateSubmission(sub.id, {
@@ -1037,12 +1044,14 @@ function bindSubmissionsEvents() {
 
   // Regenerate single
   document.getElementById('regen-one-btn')?.addEventListener('click', async () => {
-    const style = sub.style || 'inquiry';
+    const aiSettings = getAiSettings();
+    const style = sub.style || aiSettings.defaultStyle || 'inquiry';
     const nextText = generateSeteuk({
       answers: sub.answers,
       fields: course.fields,
       course,
       style,
+      aiSettings,
     });
     try {
       const updated = await api.updateSubmission(sub.id, {
@@ -1052,7 +1061,7 @@ function bindSubmissionsEvents() {
       });
       replaceLocalSubmission(updated);
       renderTeacherApp();
-      showToast('세특 초안을 다시 생성했습니다.');
+      showToast('현재 내장 AI 설정으로 세특 초안을 다시 생성했습니다.');
     } catch (err) {
       showToast(err.message, 'error');
     }
@@ -1062,19 +1071,20 @@ function bindSubmissionsEvents() {
   document.getElementById('ai-refine-btn')?.addEventListener('click', async () => {
     const apiKey = getGeminiKey();
     if (!apiKey) {
-      openAiSettingsModal();
+      openAiSettingsModal('gemini');
       return;
     }
     state.isGeneratingAi = true;
     renderTeacherApp();
     try {
+      const aiSettings = getAiSettings();
       const refined = await refineWithGemini({
         apiKey,
         course,
-        student: sub,
         answers: sub.answers,
         fields: course.fields,
-        style: sub.style || 'inquiry',
+        style: sub.style || aiSettings.defaultStyle || 'inquiry',
+        aiSettings,
       });
       const updated = await api.updateSubmission(sub.id, {
         generatedText: refined,
@@ -1548,47 +1558,349 @@ async function openQrModal(course, fullscreen = false) {
   renderModal();
 }
 
-function openAiSettingsModal() {
-  const existingKey = getGeminiKey();
-  modalRoot.innerHTML = `
-    <div class="modal-backdrop" id="modal-backdrop">
-      <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="ai-modal-title">
-        <div class="modal-head">
-          <h3 id="ai-modal-title">AI 세특 다듬기 설정 (선택 사항)</h3>
-          <button type="button" class="btn btn-ghost btn-icon" id="modal-close-btn">✕</button>
-        </div>
-        <form id="ai-settings-form">
-          <div class="modal-body">
-            <p style="font-size:13.5px;color:var(--text-secondary);">
-              기본 내장 엔진만으로도 1~7번 항목을 토대로 NEIS 문체 세특이 즉시 자동 작성됩니다.<br/>
-              추가로 <strong>Gemini API 키</strong>를 입력해 두면, 개별 학생 세특을 AI로 한 번 더 자연스럽게 다듬는 버튼을 사용할 수 있습니다.
-            </p>
-            <div class="field-group">
-              <label for="gemini-key-input">Gemini API Key (이 브라우저에만 저장됨)</label>
-              <input id="gemini-key-input" type="password" class="input" value="${escapeHtml(existingKey)}" placeholder="AIza..." autocomplete="off" />
+function openAiSettingsModal(initialTab = 'builtin') {
+  let activeTab = initialTab;
+  let draft = getAiSettings();
+  let geminiKey = getGeminiKey();
+  let applyToAll = false;
+
+  const activeCourse = getActiveCourse();
+  const sampleCourse = activeCourse || { title: '물리학 실험', fields: cloneDefaultFields() };
+  const sampleAnswers = {
+    new_concept: '빛의 간섭과 회절 원리',
+    refined_concept: '마찰력이 접촉 면적이 아니라 수직항력에 비례한다는 개념',
+    activity_1: '이중 슬릿 간섭 무늬 측정 실험',
+    reason_1: '이론 파장과 실제 측정값을 비교하며 오차 원인을 분석할 수 있었기 때문입니다',
+    activity_2: '센서 기반 단진자 주기 측정 탐구',
+    reason_2: '측정 데이터를 그래프로 정리해 주기 공식을 직접 검증해 보았습니다',
+    developed_ability: '변인 통제 및 실험 데이터 해석 역량',
+  };
+
+  const renderPreviewText = () =>
+    generateSeteuk({
+      answers: sampleAnswers,
+      fields: cloneDefaultFields(),
+      course: sampleCourse,
+      style: draft.defaultStyle,
+      aiSettings: draft,
+    });
+
+  const renderModal = () => {
+    const preview = renderPreviewText();
+    const previewBytes = calcNeisBytes(preview);
+
+    const styleOptions = GENERATION_STYLES.map(
+      (s) =>
+        `<option value="${s.id}"${draft.defaultStyle === s.id ? ' selected' : ''}>${escapeHtml(
+          s.label
+        )} — ${escapeHtml(s.description)}</option>`
+    ).join('');
+
+    const detailOptions = AI_DETAIL_LEVELS.map(
+      (d) =>
+        `<option value="${d.id}"${draft.detailLevel === d.id ? ' selected' : ''}>${escapeHtml(
+          d.label
+        )} (${escapeHtml(d.description)})</option>`
+    ).join('');
+
+    const toneOptions = AI_ENDING_TONES.map(
+      (t) =>
+        `<option value="${t.id}"${draft.endingTone === t.id ? ' selected' : ''}>${escapeHtml(
+          t.label
+        )}</option>`
+    ).join('');
+
+    const closingOptions = AI_CLOSING_TEMPLATES.map(
+      (c) =>
+        `<option value="${c.id}"${draft.closingTemplate === c.id ? ' selected' : ''}>${escapeHtml(
+          c.label
+        )}</option>`
+    ).join('');
+
+    modalRoot.innerHTML = `
+      <div class="modal-backdrop" id="modal-backdrop">
+        <div class="modal-dialog ai-modal" role="dialog" aria-modal="true" aria-labelledby="ai-modal-title">
+          <div class="modal-head">
+            <h3 id="ai-modal-title">내장 AI 및 세특 자동 작성 설정</h3>
+            <button type="button" class="btn btn-ghost btn-icon" id="modal-close-btn">✕</button>
+          </div>
+
+          <div class="modal-tabs" role="tablist">
+            <button type="button" class="modal-tab-btn${activeTab === 'builtin' ? ' active' : ''}" data-ai-tab="builtin">
+              내장 AI 엔진 조절 (기본)
+            </button>
+            <button type="button" class="modal-tab-btn${activeTab === 'gemini' ? ' active' : ''}" data-ai-tab="gemini">
+              외부 Gemini AI 연동 (선택)${geminiKey.trim() ? ' ●' : ''}
+            </button>
+          </div>
+
+          <form id="ai-settings-form">
+            <div class="modal-body">
+              ${
+                activeTab === 'builtin'
+                  ? `
+                <div class="field-group">
+                  <label for="ai-default-style">기본 문체 스타일</label>
+                  <select id="ai-default-style" class="select">${styleOptions}</select>
+                </div>
+
+                <div class="form-grid-2">
+                  <div class="field-group">
+                    <label for="ai-detail-level">서술 분량 · 상세도</label>
+                    <select id="ai-detail-level" class="select">${detailOptions}</select>
+                  </div>
+                  <div class="field-group">
+                    <label for="ai-ending-tone">종결 어미 톤</label>
+                    <select id="ai-ending-tone" class="select">${toneOptions}</select>
+                  </div>
+                </div>
+
+                <div class="form-grid-2">
+                  <div class="field-group">
+                    <label for="ai-closing-template">마무리 문장 스타일</label>
+                    <select id="ai-closing-template" class="select">${closingOptions}</select>
+                  </div>
+                  <div class="field-group">
+                    <label for="ai-focus-keywords">교사 강조 키워드 (쉼표 구분)</label>
+                    <input id="ai-focus-keywords" type="text" class="input" value="${escapeHtml(
+                      draft.focusKeywords || ''
+                    )}" placeholder="예: 자기주도적 탐구, 과학적 의사소통" />
+                  </div>
+                </div>
+
+                <div class="switch-row">
+                  <div class="switch-label">
+                    <strong>과목명 서두 포함</strong>
+                    <span>문장 시작에 '${escapeHtml(sampleCourse.title)} 수업에서...' 형태로 과목명을 포함합니다.</span>
+                  </div>
+                  <label class="switch">
+                    <input id="ai-include-course" type="checkbox" ${draft.includeCourseTitle ? 'checked' : ''} />
+                    <span class="switch-slider"></span>
+                  </label>
+                </div>
+
+                <div class="switch-row">
+                  <div class="switch-label">
+                    <strong>오개념 교정(2번 항목) 대비 강조</strong>
+                    <span>'기존에 막연히 알던 개념 → 과학적 근거로 재정립' 흐름을 부각합니다.</span>
+                  </div>
+                  <label class="switch">
+                    <input id="ai-emphasize-misconception" type="checkbox" ${
+                      draft.emphasizeMisconception ? 'checked' : ''
+                    } />
+                    <span class="switch-slider"></span>
+                  </label>
+                </div>
+
+                <div class="switch-row">
+                  <div class="switch-label">
+                    <strong>NEIS 1,500 Bytes 초과 시 자동 압축</strong>
+                    <span>생성된 세특이 1,500 Bytes를 넘으면 자동으로 간결 문체로 조절합니다.</span>
+                  </div>
+                  <label class="switch">
+                    <input id="ai-auto-fit" type="checkbox" ${draft.autoFitNeisLimit ? 'checked' : ''} />
+                    <span class="switch-slider"></span>
+                  </label>
+                </div>
+
+                <div class="ai-preview-box">
+                  <div class="ai-preview-head">
+                    <span>실시간 내장 AI 생성 미리보기</span>
+                    <span id="ai-preview-bytes" class="byte-count-mono${
+                      previewBytes > NEIS_BYTE_LIMIT ? ' over' : ''
+                    }">${previewBytes.toLocaleString()} / ${NEIS_BYTE_LIMIT.toLocaleString()} Bytes · ${
+                      preview.length
+                    }자</span>
+                  </div>
+                  <div id="ai-preview-text" class="ai-preview-text">${escapeHtml(preview)}</div>
+                </div>
+
+                ${
+                  state.submissions.length > 0
+                    ? `
+                  <label style="display:flex;align-items:center;gap:8px;font-size:13.5px;cursor:pointer;">
+                    <input id="ai-apply-all" type="checkbox" ${applyToAll ? 'checked' : ''} />
+                    <span>저장 시 현재 과목의 기존 제출 응답(${state.submissions.length}명) 세특에도 즉시 재적용</span>
+                  </label>
+                `
+                    : ''
+                }
+              `
+                  : `
+                <p style="font-size:13.5px;color:var(--text-secondary);">
+                  내장 AI만으로도 즉시 자동 작성되지만, <strong>Gemini API 키</strong>를 등록하면 학생별 상세 화면에서 <em>AI로 다듬기</em> 버튼을 추가로 사용할 수 있습니다.
+                </p>
+                <div class="field-group">
+                  <label for="gemini-key-input">Gemini API Key (이 브라우저에만 저장됨)</label>
+                  <input id="gemini-key-input" type="password" class="input" value="${escapeHtml(
+                    geminiKey
+                  )}" placeholder="AIza..." autocomplete="off" />
+                </div>
+                <div class="form-grid-2">
+                  <div class="field-group">
+                    <label for="gemini-model-select">모델 선택</label>
+                    <select id="gemini-model-select" class="select">
+                      <option value="gemini-2.0-flash"${
+                        draft.geminiModel === 'gemini-2.0-flash' ? ' selected' : ''
+                      }>gemini-2.0-flash (빠름 · 권장)</option>
+                      <option value="gemini-2.5-flash"${
+                        draft.geminiModel === 'gemini-2.5-flash' ? ' selected' : ''
+                      }>gemini-2.5-flash (최신 균형)</option>
+                      <option value="gemini-2.5-pro"${
+                        draft.geminiModel === 'gemini-2.5-pro' ? ' selected' : ''
+                      }>gemini-2.5-pro (정교함)</option>
+                    </select>
+                  </div>
+                  <div class="field-group">
+                    <label for="gemini-temp-range">문장 다양성 (Temperature: <span id="gemini-temp-val">${Number(
+                      draft.geminiTemperature ?? 0.5
+                    ).toFixed(1)}</span>)</label>
+                    <div class="range-row">
+                      <span style="font-size:12px;color:var(--text-muted);">차분</span>
+                      <input id="gemini-temp-range" type="range" min="0.1" max="1.0" step="0.1" value="${Number(
+                        draft.geminiTemperature ?? 0.5
+                      )}" />
+                      <span style="font-size:12px;color:var(--text-muted);">풍부</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="field-group">
+                  <label for="gemini-instruction">추가 작성 지침 (선택)</label>
+                  <textarea id="gemini-instruction" class="textarea" rows="3" placeholder="예: 실험 과정에서의 오차 분석과 협력적 태도를 자연스럽게 강조해 주세요.">${escapeHtml(
+                    draft.geminiInstruction || ''
+                  )}</textarea>
+                </div>
+              `
+              }
             </div>
-          </div>
-          <div class="modal-foot">
-            <button type="button" class="btn btn-secondary" id="modal-cancel-btn">취소</button>
-            <button type="submit" class="btn btn-primary">저장</button>
-          </div>
-        </form>
+
+            <div class="modal-foot" style="justify-content:space-between;">
+              <button type="button" class="btn btn-ghost btn-sm" id="ai-reset-btn">기본값 복원</button>
+              <div style="display:flex;gap:8px;">
+                <button type="button" class="btn btn-secondary" id="modal-cancel-btn">취소</button>
+                <button type="submit" class="btn btn-primary">설정 저장</button>
+              </div>
+            </div>
+          </form>
+        </div>
       </div>
-    </div>
-  `;
+    `;
 
-  document.getElementById('modal-close-btn')?.addEventListener('click', closeModal);
-  document.getElementById('modal-cancel-btn')?.addEventListener('click', closeModal);
-  document.getElementById('modal-backdrop')?.addEventListener('click', (e) => {
-    if (e.target.id === 'modal-backdrop') closeModal();
-  });
+    const updateLivePreview = () => {
+      const next = renderPreviewText();
+      const bytes = calcNeisBytes(next);
+      const textEl = document.getElementById('ai-preview-text');
+      const bytesEl = document.getElementById('ai-preview-bytes');
+      if (textEl) textEl.textContent = next;
+      if (bytesEl) {
+        bytesEl.textContent = `${bytes.toLocaleString()} / ${NEIS_BYTE_LIMIT.toLocaleString()} Bytes · ${next.length}자`;
+        bytesEl.className = `byte-count-mono${bytes > NEIS_BYTE_LIMIT ? ' over' : ''}`;
+      }
+    };
 
-  document.getElementById('ai-settings-form')?.addEventListener('submit', (e) => {
-    e.preventDefault();
-    const key = document.getElementById('gemini-key-input').value;
-    setGeminiKey(key);
-    closeModal();
-    renderTeacherApp();
-    showToast(key.trim() ? 'Gemini API 키를 저장했습니다.' : 'API 키를 삭제했습니다.');
-  });
+    document.getElementById('modal-close-btn')?.addEventListener('click', closeModal);
+    document.getElementById('modal-cancel-btn')?.addEventListener('click', closeModal);
+    document.getElementById('modal-backdrop')?.addEventListener('click', (e) => {
+      if (e.target.id === 'modal-backdrop') closeModal();
+    });
+
+    document.querySelectorAll('[data-ai-tab]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        activeTab = btn.getAttribute('data-ai-tab');
+        renderModal();
+      });
+    });
+
+    document.getElementById('ai-reset-btn')?.addEventListener('click', () => {
+      draft = { ...DEFAULT_AI_SETTINGS };
+      renderModal();
+      showToast('내장 AI 설정을 기본값으로 되돌렸습니다.');
+    });
+
+    // Built-in tab bindings
+    document.getElementById('ai-default-style')?.addEventListener('change', (e) => {
+      draft.defaultStyle = e.target.value;
+      updateLivePreview();
+    });
+    document.getElementById('ai-detail-level')?.addEventListener('change', (e) => {
+      draft.detailLevel = e.target.value;
+      updateLivePreview();
+    });
+    document.getElementById('ai-ending-tone')?.addEventListener('change', (e) => {
+      draft.endingTone = e.target.value;
+      updateLivePreview();
+    });
+    document.getElementById('ai-closing-template')?.addEventListener('change', (e) => {
+      draft.closingTemplate = e.target.value;
+      updateLivePreview();
+    });
+    document.getElementById('ai-focus-keywords')?.addEventListener('input', (e) => {
+      draft.focusKeywords = e.target.value;
+      updateLivePreview();
+    });
+    document.getElementById('ai-include-course')?.addEventListener('change', (e) => {
+      draft.includeCourseTitle = e.target.checked;
+      updateLivePreview();
+    });
+    document.getElementById('ai-emphasize-misconception')?.addEventListener('change', (e) => {
+      draft.emphasizeMisconception = e.target.checked;
+      updateLivePreview();
+    });
+    document.getElementById('ai-auto-fit')?.addEventListener('change', (e) => {
+      draft.autoFitNeisLimit = e.target.checked;
+      updateLivePreview();
+    });
+    document.getElementById('ai-apply-all')?.addEventListener('change', (e) => {
+      applyToAll = e.target.checked;
+    });
+
+    // Gemini tab bindings
+    document.getElementById('gemini-key-input')?.addEventListener('input', (e) => {
+      geminiKey = e.target.value;
+    });
+    document.getElementById('gemini-model-select')?.addEventListener('change', (e) => {
+      draft.geminiModel = e.target.value;
+    });
+    document.getElementById('gemini-temp-range')?.addEventListener('input', (e) => {
+      draft.geminiTemperature = Number(e.target.value);
+      const valEl = document.getElementById('gemini-temp-val');
+      if (valEl) valEl.textContent = draft.geminiTemperature.toFixed(1);
+    });
+    document.getElementById('gemini-instruction')?.addEventListener('input', (e) => {
+      draft.geminiInstruction = e.target.value;
+    });
+
+    document.getElementById('ai-settings-form')?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      saveAiSettings(draft);
+      setGeminiKey(geminiKey);
+      closeModal();
+
+      if (applyToAll && activeCourse && state.submissions.length > 0) {
+        try {
+          const updates = state.submissions.map((sub) => {
+            const generatedText = generateSeteuk({
+              answers: sub.answers,
+              fields: activeCourse.fields,
+              course: activeCourse,
+              style: draft.defaultStyle,
+              aiSettings: draft,
+            });
+            return { id: sub.id, generatedText, style: draft.defaultStyle, status: 'auto' };
+          });
+          await api.bulkUpdateSubmissions(updates);
+          await selectCourse(activeCourse.id, true);
+          showToast(`내장 AI 설정을 저장하고 ${updates.length}명의 세특에 즉시 적용했습니다.`);
+          return;
+        } catch (err) {
+          showToast(err.message, 'error');
+        }
+      }
+
+      renderTeacherApp();
+      showToast('내장 AI 설정을 저장했습니다.');
+    });
+  };
+
+  renderModal();
 }

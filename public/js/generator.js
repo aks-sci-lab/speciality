@@ -1,9 +1,11 @@
 /**
  * Korean NEIS 세부능력 및 특기사항(세특) 자동 생성 엔진
- * - 1~7번 핵심 항목 + 교사가 추가한 사용자 정의 항목을 자연스러운 NEIS 문체(~함., ~보임., ~이룸.)로 변환
+ * - 1~7번 핵심 항목 + 교사가 추가한 사용자 정의 항목을 자연스러운 NEIS 문체로 변환
+ * - 내장 AI 설정 조절(분량 상세도, 종결 어미, 과목명 포함, 오개념 교정 강조, 교사 강조 키워드, 1,500B 자동 맞춤) 지원
  * - 받침 기반 한국어 조사(을/를, 이/가, 은/는, 과/와, 으로/로) 자동 처리
- * - NEIS UTF-8 바이트 계산 (한글 3바이트, 줄바꿈 2바이트, 영문/숫자/공백 1바이트, 기준 1,500 Bytes)
  */
+
+import { DEFAULT_AI_SETTINGS } from './defaults.js';
 
 export const NEIS_BYTE_LIMIT = 1500;
 
@@ -12,9 +14,9 @@ export function calcNeisBytes(text = '') {
   for (let i = 0; i < text.length; i += 1) {
     const code = text.charCodeAt(i);
     if (code === 10) {
-      bytes += 2; // NEIS counts newline as 2 bytes
+      bytes += 2;
     } else if (code > 127) {
-      bytes += 3; // UTF-8 Korean / multibyte character
+      bytes += 3;
     } else {
       bytes += 1;
     }
@@ -33,7 +35,6 @@ function getLastHangulBatchim(word) {
     const jong = (code - 0xac00) % 28;
     return { hasBatchim: jong !== 0, isRieul: jong === 8 };
   }
-  // Digits & common English endings approximation
   if (/[013678lmnrLMNR]/.test(lastChar)) {
     return { hasBatchim: true, isRieul: /[178lL]/.test(lastChar) };
   }
@@ -60,14 +61,10 @@ function cleanPhrase(raw) {
     .trim();
 }
 
-/**
- * Convert a student's casual reason sentence into a clean NEIS-friendly nominal/clause form
- */
 function toReasonClause(raw) {
   let text = cleanPhrase(raw);
   if (!text) return '';
 
-  // Remove polite/casual endings to embed smoothly (order matters: specific before general)
   const replacements = [
     [/(기 때문입니다|기 때문이에요|기 때문이다|기 때문에)$/, '기 때문에'],
     [/(때문입니다|때문이에요|때문이다|때문에)$/, '때문에'],
@@ -95,9 +92,6 @@ function toReasonClause(raw) {
   return text;
 }
 
-/**
- * Convert a casual sentence into a standalone NEIS-style (~함./~임.) ending
- */
 function toNeisEnding(raw) {
   let text = cleanPhrase(raw);
   if (!text) return '';
@@ -161,18 +155,44 @@ function extractByRoles(answers = {}, fields = []) {
   };
 }
 
-function buildReasonSentence(activity, reason, style, isSecond = false) {
+function getToneEndings(endingTone) {
+  if (endingTone === 'competency') {
+    return {
+      conceptEnd: '과학적 사고력을 바탕으로 명확히 정립함.',
+      activityEnd: '우수한 탐구 역량과 문제 해결력을 드러냄.',
+      abilityEnd: '한층 신장시키며 높은 교과 역량을 발휘함.',
+      potentialEnd: '앞으로도 깊이 있는 탐구를 이어갈 역량이 돋보임.',
+    };
+  }
+  if (endingTone === 'growth') {
+    return {
+      conceptEnd: '스스로 개념을 확장하며 깊이 있게 이해함.',
+      activityEnd: '자기주도적 학습 태도를 한층 성숙시킴.',
+      abilityEnd: '꾸준히 발전시키는 의미 있는 성장을 이룸.',
+      potentialEnd: '배움에 대한 진지한 태도를 바탕으로 향후 지속적인 발전이 기대됨.',
+    };
+  }
+  return {
+    conceptEnd: '과학적 근거를 토대로 정확하게 정립함.',
+    activityEnd: '높은 탐구 의욕과 성실한 참여 태도를 보임.',
+    abilityEnd: '한층 발전시키며 과학적 문제 해결력을 기름.',
+    potentialEnd: '학습 내용을 스스로 점검하고 확장하는 태도가 인상적임.',
+  };
+}
+
+function buildReasonSentence(activity, reason, style, settings, isSecond = false) {
   const act = cleanPhrase(activity);
   const rsn = cleanPhrase(reason);
   if (!act && !rsn) return '';
 
-  const prefix = isSecond ? '또한 ' : '특히 ';
+  const prefix = isSecond ? (settings.detailLevel === 'detailed' ? '나아가 ' : '또한 ') : '특히 ';
+  const tone = getToneEndings(settings.endingTone);
 
   if (act && !rsn) {
-    if (style === 'concise') {
+    if (style === 'concise' || settings.detailLevel === 'brief') {
       return `${prefix}'${act}' 활동에 적극 참여하여 탐구 역량을 발휘함.`;
     }
-    return `${prefix}'${act}' 활동에 주도적으로 참여하며 수업 내용을 실제 탐구로 확장하는 태도를 보임.`;
+    return `${prefix}'${act}' 활동에 주도적으로 참여하며 ${tone.activityEnd}`;
   }
 
   if (!act && rsn) {
@@ -183,7 +203,7 @@ function buildReasonSentence(activity, reason, style, isSecond = false) {
   const endsWithBecause = /때문에$/.test(clause);
   const endsWithModifier = /(던|한|된|인|운|낀|은|는|을|를|적|본)$/.test(clause);
 
-  if (style === 'concise') {
+  if (style === 'concise' || settings.detailLevel === 'brief') {
     if (endsWithBecause) {
       return `${prefix}'${act}' 활동에서 ${clause} 적극적인 탐구 태도를 보임.`;
     }
@@ -193,50 +213,64 @@ function buildReasonSentence(activity, reason, style, isSecond = false) {
     return `${prefix}'${act}' 활동에 참여하였으며, ${toNeisEnding(rsn)}`;
   }
 
+  if (settings.detailLevel === 'detailed') {
+    if (endsWithBecause) {
+      return `${prefix}'${act}' 활동에 주도적으로 참여하였으며, ${clause} 이론과 실제 현상을 연결하며 탐구의 깊이를 더하고 ${tone.activityEnd}`;
+    }
+    if (endsWithModifier) {
+      return `${prefix}'${act}' 활동을 수행하는 과정에서 ${clause} 경험을 바탕으로 핵심 원리를 체계적으로 분석하며 ${tone.activityEnd}`;
+    }
+    return `${prefix}'${act}' 활동에 몰입하여 ${toNeisEnding(rsn)} 이를 통해 탐구 과정을 논리적으로 정리하며 ${tone.activityEnd}`;
+  }
+
   if (style === 'growth') {
     if (endsWithBecause) {
       return `${prefix}'${act}' 활동에 깊은 흥미를 가지고 참여하였으며, ${clause} 스스로 질문을 던지며 탐구의 폭을 넓힘.`;
     }
     if (endsWithModifier) {
-      return `${prefix}'${act}' 활동을 수행하며 ${clause} 경험을 통해 자기주도적 학습 태도를 한층 성숙시킴.`;
+      return `${prefix}'${act}' 활동을 수행하며 ${clause} 경험을 통해 ${tone.activityEnd}`;
     }
     return `${prefix}'${act}' 활동을 통해 유의미한 학습 경험을 쌓았으며, ${toNeisEnding(rsn)}`;
   }
 
-  // Default: 'inquiry'
+  // Default: inquiry + standard
   if (endsWithBecause) {
     return `${prefix}'${act}' 활동에 적극적으로 참여하였으며, ${clause} 과학적 호기심을 바탕으로 깊이 있게 탐구함.`;
   }
   if (endsWithModifier) {
-    return `${prefix}'${act}' 활동에 주도적으로 참여하여 ${clause} 점에서 우수한 탐구 의욕과 몰입도를 드러냄.`;
+    return `${prefix}'${act}' 활동에 주도적으로 참여하여 ${clause} 점에서 ${tone.activityEnd}`;
   }
   return `${prefix}'${act}' 활동에 적극적으로 참여하였으며, ${toNeisEnding(rsn)}`;
 }
 
-/**
- * Main NEIS 세특 auto-generator
- */
-export function generateSeteuk({ answers = {}, fields = [], course = {}, style = 'inquiry' }) {
-  const data = extractByRoles(answers, fields);
+function buildCoreText({ data, course, style, settings }) {
   const sentences = [];
   const courseTitle = cleanPhrase(course.title);
-  const subjectPrefix = courseTitle ? `${courseTitle} 수업에서 ` : '수업 과정에서 ';
+  const subjectPrefix =
+    settings.includeCourseTitle && courseTitle ? `${courseTitle} 수업에서 ` : '수업 과정에서 ';
+  const tone = getToneEndings(settings.endingTone);
 
   // 1 & 2. 새로 알게 된 개념 + 과학적으로 더 정확히 알게 된 개념
   if (data.newConcept && data.refinedConcept) {
     const newJosa = josa(data.newConcept, '을', '를');
     const refJosa = josa(data.refinedConcept, '을', '를');
-    if (style === 'concise') {
+    if (style === 'concise' || settings.detailLevel === 'brief') {
       sentences.push(
         `${subjectPrefix}'${data.newConcept}'${newJosa} 새롭게 학습하고, '${data.refinedConcept}'${refJosa} 과학적 근거에 기반해 정확히 정립함.`
       );
-    } else if (style === 'growth') {
-      sentences.push(
-        `${subjectPrefix}'${data.newConcept}'의 개념을 새롭게 습득하며 지적 호기심을 넓혔으며, 기존에 막연히 이해하던 '${data.refinedConcept}'에 대해 과학적 원리를 바탕으로 개념을 명확히 재정립함.`
-      );
+    } else if (settings.emphasizeMisconception) {
+      if (settings.detailLevel === 'detailed') {
+        sentences.push(
+          `${subjectPrefix}'${data.newConcept}'의 핵심 원리를 새롭게 습득하여 개념적 기반을 넓혔으며, 기존에 막연히 이해하거나 오개념을 지니기 쉬웠던 '${data.refinedConcept}'에 대해 ${tone.conceptEnd}`
+        );
+      } else {
+        sentences.push(
+          `${subjectPrefix}'${data.newConcept}'의 원리를 새롭게 이해하였으며, 기존에 막연히 알고 있던 '${data.refinedConcept}'에 대해 ${tone.conceptEnd}`
+        );
+      }
     } else {
       sentences.push(
-        `${subjectPrefix}'${data.newConcept}'의 원리를 새롭게 이해하였으며, '${data.refinedConcept}'에 대해 과학적 근거를 토대로 개념을 보다 정교하고 정확하게 정립함.`
+        `${subjectPrefix}'${data.newConcept}'의 원리를 새롭게 이해하고, '${data.refinedConcept}'에 대해 ${tone.conceptEnd}`
       );
     }
   } else if (data.newConcept) {
@@ -252,11 +286,17 @@ export function generateSeteuk({ answers = {}, fields = [], course = {}, style =
   }
 
   // 3 & 4. 인상 깊었던 활동 1 + 이유 1
-  const act1Sentence = buildReasonSentence(data.activity1, data.reason1, style, false);
+  const act1Sentence = buildReasonSentence(data.activity1, data.reason1, style, settings, false);
   if (act1Sentence) sentences.push(act1Sentence);
 
   // 5 & 6. 인상 깊었던 활동 2 + 이유 2
-  const act2Sentence = buildReasonSentence(data.activity2, data.reason2, style, Boolean(act1Sentence));
+  const act2Sentence = buildReasonSentence(
+    data.activity2,
+    data.reason2,
+    style,
+    settings,
+    Boolean(act1Sentence)
+  );
   if (act2Sentence) sentences.push(act2Sentence);
 
   // Custom teacher-defined fields
@@ -267,41 +307,125 @@ export function generateSeteuk({ answers = {}, fields = [], course = {}, style =
     sentences.push(`${labelClean} 측면에서 ${toNeisEnding(valClean)}`);
   }
 
-  // 7. 내가 발전시킨 능력
+  // 7. 내가 발전시킨 능력 + 교사 강조 키워드
+  const keywords = String(settings.focusKeywords || '')
+    .split(',')
+    .map((k) => cleanPhrase(k))
+    .filter(Boolean);
+
   if (data.developedAbility) {
     const ab = data.developedAbility;
     const abJosa = josa(ab, '을', '를');
     const abEuro = euro(ab);
-    if (style === 'concise') {
-      sentences.push(`일련의 활동을 통해 '${ab}'${abJosa} 발전시키는 성장을 이룸.`);
+    const kwClause =
+      keywords.length > 0 ? ` ${keywords.join(' 및 ')} 측면과 더불어` : '';
+
+    if (style === 'concise' || settings.detailLevel === 'brief') {
+      sentences.push(`일련의 활동을 통해${kwClause} '${ab}'${abJosa} 발전시키는 성장을 이룸.`);
     } else if (style === 'growth') {
       sentences.push(
-        `이러한 꾸준한 학습과 탐구 경험을 바탕으로 '${ab}'${abEuro} 이어지는 의미 있는 학업적 성장을 이루어 앞으로의 발전이 기대됨.`
+        `이러한 꾸준한 학습과 탐구 경험을 바탕으로${kwClause} '${ab}'${abEuro} 이어지는 의미 있는 학업적 성장을 이룸.`
       );
     } else {
       sentences.push(
-        `일련의 개념 학습과 탐구 활동을 통해 '${ab}'${abJosa} 한층 발전시키며 과학적 문제 해결력을 신장함.`
+        `일련의 개념 학습과 탐구 활동을 통해${kwClause} '${ab}'${abJosa} ${tone.abilityEnd}`
       );
     }
+  } else if (keywords.length > 0) {
+    const joined = keywords.join(', ');
+    sentences.push(
+      `수업 전반에서 '${joined}'${josa(joined, '을', '를')} 꾸준히 발휘하며 성실히 참여함.`
+    );
   }
 
-  if (sentences.length === 0) {
-    return '학생이 입력한 내용이 충분하지 않아 세부능력 및 특기사항 초안을 생성할 수 없습니다.';
+  // Optional closing sentence
+  if (settings.closingTemplate === 'potential') {
+    sentences.push(tone.potentialEnd);
+  } else if (
+    settings.closingTemplate === 'auto' &&
+    settings.detailLevel === 'detailed' &&
+    sentences.length > 0
+  ) {
+    sentences.push(tone.potentialEnd);
   }
 
   return sentences.join(' ');
 }
 
 /**
+ * Main NEIS 세특 auto-generator
+ */
+export function generateSeteuk({
+  answers = {},
+  fields = [],
+  course = {},
+  style = null,
+  aiSettings = {},
+}) {
+  const settings = { ...DEFAULT_AI_SETTINGS, ...(aiSettings || {}) };
+  const effectiveStyle = style || settings.defaultStyle || 'inquiry';
+  const data = extractByRoles(answers, fields);
+
+  let result = buildCoreText({ data, course, style: effectiveStyle, settings });
+
+  if (!result) {
+    return '학생이 입력한 내용이 충분하지 않아 세부능력 및 특기사항 초안을 생성할 수 없습니다.';
+  }
+
+  // Auto-compress if exceeding NEIS 1,500 Bytes and option is enabled
+  if (settings.autoFitNeisLimit && calcNeisBytes(result) > NEIS_BYTE_LIMIT) {
+    const compactSettings = {
+      ...settings,
+      detailLevel: 'brief',
+      closingTemplate: 'none',
+    };
+    const compacted = buildCoreText({ data, course, style: 'concise', settings: compactSettings });
+    if (calcNeisBytes(compacted) < calcNeisBytes(result)) {
+      result = compacted;
+    }
+  }
+
+  return result;
+}
+
+/**
  * Optional Gemini API refinement (only called if teacher enters their own API key in settings)
  */
-export async function refineWithGemini({ apiKey, course, student, answers, fields, style }) {
+export async function refineWithGemini({
+  apiKey,
+  course,
+  answers,
+  fields,
+  style,
+  aiSettings = {},
+}) {
+  const settings = { ...DEFAULT_AI_SETTINGS, ...(aiSettings || {}) };
+  const effectiveStyle = style || settings.defaultStyle || 'inquiry';
   const styleLabel =
-    style === 'growth' ? '성장 서사형' : style === 'concise' ? '간결 요약형' : '탐구 중심형';
+    effectiveStyle === 'growth'
+      ? '성장 서사형'
+      : effectiveStyle === 'concise'
+      ? '간결 요약형'
+      : '탐구 중심형';
+
+  const detailGuide =
+    settings.detailLevel === 'brief'
+      ? '약 200~280자(600~850 Bytes)'
+      : settings.detailLevel === 'detailed'
+      ? '약 400~480자(1,200~1,450 Bytes)'
+      : '약 300~380자(900~1,150 Bytes)';
 
   const qaLines = fields
     .map((f, idx) => `${idx + 1}. ${f.label}: ${answers[f.id] || '(미작성)'}`)
     .join('\n');
+
+  const extraRules = [];
+  if (settings.focusKeywords?.trim()) {
+    extraRules.push(`- 교사 강조 키워드 반영: ${settings.focusKeywords.trim()}`);
+  }
+  if (settings.geminiInstruction?.trim()) {
+    extraRules.push(`- 추가 작성 지침: ${settings.geminiInstruction.trim()}`);
+  }
 
   const prompt = [
     '당신은 대한민국 고등학교 교사입니다. 아래 학생의 자기평가 응답을 바탕으로 학교생활기록부 [세부능력 및 특기사항]을 작성해 주세요.',
@@ -311,7 +435,8 @@ export async function refineWithGemini({ apiKey, course, student, answers, field
     '2. 학생 이름, 학교명, 사교육/외부 대회 등 NEIS 기재 금지 사항은 절대 포함하지 말 것.',
     '3. 학생이 작성한 핵심 개념, 활동, 이유, 발전시킨 능력을 누락 없이 자연스럽게 하나의 문단으로 연결할 것.',
     `4. 문체 스타일: ${styleLabel}`,
-    '5. 분량: 공백 포함 한글 약 350~450자(1,200~1,400 Bytes 이내, 1,500 Bytes 절대 초과 금지).',
+    `5. 분량: 공백 포함 한글 ${detailGuide} 이내 (1,500 Bytes 절대 초과 금지).`,
+    ...extraRules,
     '6. 부가 설명 없이 세특 본문만 출력할 것.',
     '',
     `과목명: ${course.title || '과학'}`,
@@ -319,16 +444,18 @@ export async function refineWithGemini({ apiKey, course, student, answers, field
     qaLines,
   ].join('\n');
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(
-    apiKey
-  )}`;
+  const model = settings.geminiModel || 'gemini-2.0-flash';
+  const temperature = Number(settings.geminiTemperature ?? 0.5);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    model
+  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.5, maxOutputTokens: 700 },
+      generationConfig: { temperature, maxOutputTokens: 700 },
     }),
   });
 
