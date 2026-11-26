@@ -142,46 +142,207 @@ function serveStatic(req, res, pathname) {
   });
 }
 
-function checkCliInstalled(cmd) {
+const CLI_CACHE = new Map();
+
+function getExtraBinDirs() {
+  const dirs = [];
+  if (process.platform === 'win32') {
+    const home = process.env.USERPROFILE || '';
+    const appData = process.env.APPDATA || (home ? path.join(home, 'AppData', 'Roaming') : '');
+    const localAppData =
+      process.env.LOCALAPPDATA || (home ? path.join(home, 'AppData', 'Local') : '');
+    const candidates = [
+      appData && path.join(appData, 'npm'),
+      home && path.join(home, '.local', 'bin'),
+      home && path.join(home, '.claude', 'local'),
+      home && path.join(home, '.claude', 'bin'),
+      localAppData && path.join(localAppData, 'Programs', 'claude-code'),
+      localAppData && path.join(localAppData, 'Microsoft', 'WinGet', 'Links'),
+      localAppData && path.join(localAppData, 'pnpm'),
+      localAppData && path.join(localAppData, 'Volta', 'bin'),
+      home && path.join(home, 'scoop', 'shims'),
+      home && path.join(home, '.npm-global'),
+      process.env.NVM_SYMLINK,
+      'C:\\Program Files\\nodejs',
+      'C:\\ProgramData\\chocolatey\\bin',
+    ];
+    for (const c of candidates) {
+      if (c && fs.existsSync(c)) dirs.push(c);
+    }
+    // Also check nvm-windows installed node version folders
+    const nvmHome = process.env.NVM_HOME || (appData && path.join(appData, 'nvm'));
+    if (nvmHome && fs.existsSync(nvmHome)) {
+      try {
+        for (const entry of fs.readdirSync(nvmHome)) {
+          const full = path.join(nvmHome, entry);
+          if (/^v\d+/.test(entry) && fs.statSync(full).isDirectory()) {
+            dirs.push(full);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+  } else {
+    const home = process.env.HOME || '';
+    const candidates = [
+      home && path.join(home, '.local', 'bin'),
+      home && path.join(home, '.npm-global', 'bin'),
+      home && path.join(home, '.claude', 'local'),
+      '/opt/homebrew/bin',
+      '/usr/local/bin',
+    ];
+    for (const c of candidates) {
+      if (c && fs.existsSync(c)) dirs.push(c);
+    }
+  }
+  return dirs;
+}
+
+function getEnrichedEnv() {
+  const sep = process.platform === 'win32' ? ';' : ':';
+  const currentPath = process.env.PATH || process.env.Path || '';
+  const parts = currentPath.split(sep).filter(Boolean);
+  const existing = new Set(parts.map((p) => (process.platform === 'win32' ? p.toLowerCase() : p)));
+
+  for (const dir of getExtraBinDirs()) {
+    const key = process.platform === 'win32' ? dir.toLowerCase() : dir;
+    if (!existing.has(key)) {
+      parts.push(dir);
+      existing.add(key);
+    }
+  }
+
+  const joined = parts.join(sep);
+  return {
+    ...process.env,
+    PATH: joined,
+    ...(process.platform === 'win32' ? { Path: joined } : {}),
+  };
+}
+
+function findCliCandidates(cmd) {
+  const found = [];
+  const seen = new Set();
+  const add = (p) => {
+    if (!p) return;
+    const norm = process.platform === 'win32' ? p.toLowerCase() : p;
+    if (seen.has(norm)) return;
+    if (fs.existsSync(p)) {
+      seen.add(norm);
+      found.push(p);
+    }
+  };
+
+  const sep = process.platform === 'win32' ? ';' : ':';
+  const env = getEnrichedEnv();
+  const dirs = (env.PATH || '').split(sep).filter(Boolean);
+  const exts = process.platform === 'win32' ? ['.exe', '.cmd', '.bat'] : [''];
+
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      add(path.join(dir, `${cmd}${ext}`));
+    }
+  }
+  return found;
+}
+
+function spawnCli(binPath, args, env, stdio) {
+  const isCmdScript = process.platform === 'win32' && /\.(cmd|bat)$/i.test(binPath);
+  const execTarget = isCmdScript ? `"${binPath}"` : binPath;
+  return spawn(execTarget, args, {
+    env,
+    shell: isCmdScript,
+    windowsHide: true,
+    stdio,
+  });
+}
+
+function verifyCliBinary(binPath, env) {
   return new Promise((resolve) => {
-    const checker = process.platform === 'win32' ? 'where' : 'which';
-    execFile(checker, [cmd], { timeout: 3000 }, (err, stdout) => {
-      if (err || !stdout.trim()) return resolve({ installed: false, path: '' });
-      resolve({ installed: true, path: stdout.trim().split(/\r?\n/)[0] });
+    const child = spawnCli(binPath, ['--version'], env, ['ignore', 'pipe', 'pipe']);
+
+    let out = '';
+    let err = '';
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // ignore
+      }
+      resolve({ ok: false, version: '' });
+    }, 6000);
+
+    child.stdout.on('data', (d) => {
+      out += d.toString('utf-8');
+    });
+    child.stderr.on('data', (d) => {
+      err += d.toString('utf-8');
+    });
+    child.on('error', () => {
+      clearTimeout(timer);
+      resolve({ ok: false, version: '' });
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      const text = (out || err).trim().split(/\r?\n/)[0] || '';
+      resolve({ ok: code === 0 && text.length > 0, version: text.slice(0, 60) });
     });
   });
 }
 
-function runLocalCli(provider, prompt, model = '') {
-  return new Promise((resolve, reject) => {
-    let cmd = '';
-    let args = [];
+async function checkCliInstalled(cmd) {
+  const env = getEnrichedEnv();
+  const candidates = findCliCandidates(cmd);
 
-    if (provider === 'claude') {
-      cmd = 'claude';
-      args = ['-p', prompt, '--output-format', 'text'];
-      if (model) args.push('--model', model);
-    } else if (provider === 'gemini') {
-      cmd = 'gemini';
-      args = ['-p', prompt];
-      if (model) args.push('-m', model);
-    } else if (provider === 'codex') {
-      cmd = 'codex';
-      args = ['exec', prompt];
-      if (model) args.push('-m', model);
-    } else {
-      return reject(new Error(`지원하지 않는 CLI 공급자입니다: ${provider}`));
+  for (const candidate of candidates) {
+    const verified = await verifyCliBinary(candidate, env);
+    if (verified.ok) {
+      CLI_CACHE.set(cmd, candidate);
+      return { installed: true, path: candidate, version: verified.version };
     }
+  }
 
-    const child = spawn(cmd, args, {
-      shell: process.platform === 'win32',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+  CLI_CACHE.delete(cmd);
+  return { installed: false, path: '', version: '' };
+}
+
+async function runLocalCli(provider, prompt, model = '') {
+  const env = getEnrichedEnv();
+  let binPath = CLI_CACHE.get(provider);
+  if (!binPath || !fs.existsSync(binPath)) {
+    const status = await checkCliInstalled(provider);
+    if (!status.installed || !status.path) {
+      throw new Error(`${provider} CLI를 찾을 수 없습니다. 터미널에서 '${provider} --version'이 실행되는지 확인해 주세요.`);
+    }
+    binPath = status.path;
+  }
+
+  let args = [];
+  if (provider === 'claude') {
+    args = ['-p', '--output-format', 'text'];
+    if (model) args.push('--model', model);
+  } else if (provider === 'gemini') {
+    args = ['-p', '""'];
+    if (model) args.push('-m', model);
+  } else if (provider === 'codex') {
+    args = ['exec', '-'];
+    if (model) args.push('-m', model);
+  } else {
+    throw new Error(`지원하지 않는 CLI 공급자입니다: ${provider}`);
+  }
+
+  return new Promise((resolve, reject) => {
+    const child = spawnCli(binPath, args, env, ['pipe', 'pipe', 'pipe']);
 
     let stdout = '';
     let stderr = '';
     const timer = setTimeout(() => {
-      child.kill('SIGTERM');
+      try {
+        child.kill('SIGTERM');
+      } catch {
+        // ignore
+      }
       reject(new Error(`${provider} CLI 응답 시간이 초과되었습니다 (90초).`));
     }, 90000);
 
@@ -193,14 +354,14 @@ function runLocalCli(provider, prompt, model = '') {
     });
     child.on('error', (err) => {
       clearTimeout(timer);
-      reject(new Error(`${cmd} CLI 실행 실패: ${err.message}`));
+      reject(new Error(`${provider} CLI 실행 실패: ${err.message}`));
     });
     child.on('close', (code) => {
       clearTimeout(timer);
       if (code !== 0) {
         return reject(
           new Error(
-            `${cmd} CLI 오류 (종료코드 ${code}): ${(stderr || stdout || '로그인 상태를 확인해 주세요.').trim().slice(0, 220)}`
+            `${provider} CLI 오류 (종료코드 ${code}): ${(stderr || stdout || '로그인 상태를 확인해 주세요.').trim().slice(0, 220)}`
           )
         );
       }
@@ -210,10 +371,19 @@ function runLocalCli(provider, prompt, model = '') {
         .replace(/\s+/g, ' ')
         .trim();
       if (!cleaned) {
-        return reject(new Error(`${cmd} CLI 출력이 비어 있습니다.`));
+        return reject(new Error(`${provider} CLI 출력이 비어 있습니다.`));
       }
       resolve(cleaned);
     });
+
+    // Pass full Korean prompt safely over stdin (avoids Windows cmd.exe quoting/newline issues)
+    try {
+      child.stdin.write(prompt, 'utf-8');
+      child.stdin.end();
+    } catch (err) {
+      clearTimeout(timer);
+      reject(new Error(`${provider} CLI 입력 전달 실패: ${err.message}`));
+    }
   });
 }
 

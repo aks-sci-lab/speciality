@@ -1954,11 +1954,18 @@ function openAiSettingsModal(initialTab = 'builtin') {
                   ? `
                 <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
                   <p style="font-size:13.5px;color:var(--text-secondary);flex:1;">
-                    내 PC에서 <code>npm start</code>로 실행한 상태에서, 이미 구독·로그인된 <strong>Claude Code / Gemini CLI / Codex CLI</strong>를 추가 API 비용 없이 바로 호출합니다.
+                    Windows EXE 앱 또는 로컬 서버 실행 상태에서, PC에 설치·로그인된 <strong>Claude Code / Gemini CLI / Codex CLI</strong>를 추가 API 비용 없이 호출합니다.
                   </p>
-                  <span class="badge ${state.cliStatus?.available ? 'badge-success' : 'badge-muted'}">
-                    ${state.cliStatus?.available ? '로컬 서버 연결됨' : '정적 웹 모드 (GitHub Pages)'}
-                  </span>
+                  <div style="display:flex;align-items:center;gap:6px;">
+                    <span class="badge ${state.cliStatus?.available ? 'badge-success' : 'badge-muted'}">
+                      ${state.cliStatus?.available ? '로컬 서버 연결됨' : '정적 웹 모드'}
+                    </span>
+                    ${
+                      state.cliStatus?.available
+                        ? '<button type="button" id="rescan-cli-btn" class="btn btn-secondary btn-sm">다시 스캔</button>'
+                        : ''
+                    }
+                  </div>
                 </div>
 
                 <div class="cli-cards-grid">
@@ -1974,15 +1981,22 @@ function openAiSettingsModal(initialTab = 'builtin') {
                       return `
                         <div class="cli-card${ready ? ' ready' : ''}">
                           <div class="cli-card-title">${item.name}</div>
-                          <div class="cli-card-sub">
+                          <div class="cli-card-sub" title="${escapeHtml(info?.path || '')}">
                             ${
                               ready
-                                ? '설치 확인됨 · 사용 가능'
+                                ? `설치 확인됨${info?.version ? ` · ${escapeHtml(info.version)}` : ''}`
                                 : state.cliStatus?.available
-                                ? `미설치 (${item.cmd} CLI 필요)`
+                                ? `미설치 (${item.cmd} --version 미응답)`
                                 : item.hint
                             }
                           </div>
+                          ${
+                            ready && info?.path
+                              ? `<div style="font-family:var(--font-mono);font-size:11px;color:var(--text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(
+                                  info.path
+                                )}">${escapeHtml(info.path)}</div>`
+                              : ''
+                          }
                           <button
                             type="button"
                             class="btn ${isSelected ? 'btn-primary' : 'btn-secondary'} btn-sm"
@@ -2292,6 +2306,17 @@ function openAiSettingsModal(initialTab = 'builtin') {
     });
 
     // Local CLI tab bindings
+    document.getElementById('rescan-cli-btn')?.addEventListener('click', async () => {
+      const btn = document.getElementById('rescan-cli-btn');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = '스캔 중...';
+      }
+      state.cliStatus = await api.getCliStatus();
+      renderModal();
+      showToast('로컬 CLI 설치 상태를 다시 확인했습니다.');
+    });
+
     document.querySelectorAll('[data-select-cli]').forEach((btn) => {
       btn.addEventListener('click', () => {
         draft.activeAiProvider = btn.getAttribute('data-select-cli');
