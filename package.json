@@ -3,10 +3,12 @@
   "version": "1.0.0",
   "type": "module",
   "description": "세부능력 및 특기사항(세특) 학생 응답 수집 및 자동 작성 웹앱",
-  "main": "server.js",
+  "main": "electron-main.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "start:desktop": "electron .",
+    "build:exe": "electron-builder --win portable"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -15,5 +17,31 @@
   "dependencies": {
     "qrcode": "^1.5.4",
     "qrcode-generator": "^2.0.4"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.aksscilab.speciality",
+    "productName": "Speciality",
+    "files": [
+      "electron-main.js",
+      "server.js",
+      "public/**/*",
+      "google-apps-script/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "Speciality-Windows.exe"
+    }
   }
 }

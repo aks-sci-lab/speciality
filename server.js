@@ -12,8 +12,8 @@ const __dirname = path.dirname(__filename);
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_DIR = path.join(__dirname, 'public');
-const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
-const STORE_PATH = path.join(DATA_DIR, 'store.json');
+let DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(__dirname, 'data');
+let STORE_PATH = path.join(DATA_DIR, 'store.json');
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -491,6 +491,30 @@ const server = http.createServer(async (req, res) => {
   serveStatic(req, res, pathname);
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Speciality 세특 수집 웹앱이 실행 중입니다: http://localhost:${PORT}`);
-});
+export function startServer({ port = PORT, host = '0.0.0.0', dataDir = null } = {}) {
+  if (dataDir) {
+    DATA_DIR = path.resolve(dataDir);
+    STORE_PATH = path.join(DATA_DIR, 'store.json');
+  }
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, host, () => {
+      server.removeListener('error', reject);
+      const addr = server.address();
+      const boundPort = typeof addr === 'object' && addr ? addr.port : port;
+      const url = `http://127.0.0.1:${boundPort}`;
+      console.log(`Speciality 세특 수집 웹앱이 실행 중입니다: ${url}`);
+      resolve({ server, port: boundPort, url });
+    });
+  });
+}
+
+const isDirectRun =
+  process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename);
+
+if (isDirectRun) {
+  startServer({ port: PORT, host: '0.0.0.0' }).catch((err) => {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  });
+}

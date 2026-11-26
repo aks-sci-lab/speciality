@@ -1,4 +1,5 @@
 node_modules/
 data/store.json
+dist/
 .DS_Store
 *.log

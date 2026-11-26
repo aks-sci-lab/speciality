@@ -107,6 +107,12 @@ function setClaudeKey(key) {
 }
 
 function getDefaultBaseUrl() {
+  if (
+    (window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost') &&
+    getGasUrl()
+  ) {
+    return 'https://aks-sci-lab.github.io/speciality';
+  }
   const path = window.location.pathname.replace(/\/index\.html$/, '').replace(/\/+$/, '');
   return `${window.location.origin}${path}`;
 }

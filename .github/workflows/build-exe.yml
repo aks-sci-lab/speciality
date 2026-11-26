@@ -1,0 +1,53 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: ['main']
+    paths:
+      - 'electron-main.js'
+      - 'server.js'
+      - 'package.json'
+      - 'public/**'
+      - '.github/workflows/build-exe.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build Portable Windows EXE
+        run: npm run build:exe
+
+      - name: Upload EXE Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Speciality-Windows-EXE
+          path: dist/Speciality-Windows.exe
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Speciality Windows 실행 파일 (무설치 포터블)
+          body: |
+            ## 세특 수집기 · Speciality (Windows 무설치 `.exe`)
+
+            1. 아래 **Assets**에서 **`Speciality-Windows.exe`**를 다운로드해 더블클릭으로 실행하세요. (Node.js 설치 불필요)
+            2. Windows SmartScreen 경고가 뜨면 `추가 정보` → `실행`을 클릭하면 바로 실행됩니다.
+            3. PC에 로그인된 **Claude Code / Gemini CLI / GPT Codex CLI**와 **Google 시트 실시간 연동**을 그대로 사용할 수 있습니다.
+          files: dist/Speciality-Windows.exe
+          make_latest: true
